@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cylindrical Pillar G-code Generator</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  background: #111827;
+  color: #d1d5db;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: 100vh;
+}
+
+/* ---- Sidebar ---- */
+.sidebar {
+  background: #1f2937;
+  border-right: 1px solid #374151;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.app-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #34d399;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #374151;
+}
+
+.section {
+  background: #111827;
+  border: 1px solid #374151;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.section-title {
+  font-size: 10px;
+  font-weight: 700;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 9px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 7px;
+}
+.field:last-child { margin-bottom: 0; }
+
+label {
+  font-size: 10px;
+  color: #9ca3af;
+}
+
+input[type="number"], select, textarea {
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 4px;
+  color: #e5e7eb;
+  font-size: 12px;
+  padding: 5px 8px;
+  outline: none;
+  transition: border-color 0.15s;
+  width: 100%;
+}
+input[type="number"]:focus, select:focus, textarea:focus {
+  border-color: #34d399;
+}
+textarea {
+  font-family: 'Courier New', monospace;
+  font-size: 10px;
+  height: 130px;
+  resize: vertical;
+}
+select option { background: #1f2937; }
+
+.row2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.radio-group {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 4px 0;
+}
+.radio-option {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.radio-option input { width: auto; accent-color: #34d399; }
+.radio-option span { font-size: 12px; color: #d1d5db; }
+
+.btn {
+  border: none;
+  border-radius: 5px;
+  padding: 9px 0;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  width: 100%;
+  transition: filter 0.15s;
+}
+.btn:hover { filter: brightness(1.1); }
+.btn-primary { background: #34d399; color: #111827; }
+.btn-outline {
+  background: transparent;
+  border: 1px solid #34d399;
+  color: #34d399;
+}
+
+.error {
+  font-size: 10px;
+  color: #f87171;
+  background: rgba(248,113,113,0.08);
+  border: 1px solid rgba(248,113,113,0.25);
+  border-radius: 4px;
+  padding: 5px 8px;
+  display: none;
+}
+.error.show { display: block; }
+
+.sample-link {
+  font-size: 10px;
+  color: #34d399;
+  cursor: pointer;
+  text-decoration: underline;
+  text-align: right;
+  margin-top: 3px;
+}
+
+/* ---- Main panel ---- */
+.main {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  overflow: hidden;
+}
+
+.preview-panel {
+  position: relative;
+  background: #0d1117;
+  border-bottom: 1px solid #374151;
+  overflow: hidden;
+}
+.preview-panel canvas { display: block; width: 100%; height: 100%; }
+
+.panel-label {
+  position: absolute;
+  top: 9px;
+  left: 12px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #4b5563;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  pointer-events: none;
+}
+
+.legend {
+  position: absolute;
+  bottom: 10px;
+  left: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: none;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: #6b7280;
+}
+.legend-swatch {
+  width: 20px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.gcode-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.gcode-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px;
+  background: #1f2937;
+  border-bottom: 1px solid #374151;
+  flex-shrink: 0;
+}
+.gcode-header .label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #4b5563;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.gcode-stats {
+  font-size: 10px;
+  color: #4b5563;
+}
+
+#gcodeOutput {
+  flex: 1;
+  background: #0d1117;
+  color: #6ee7b7;
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  border: none;
+  outline: none;
+  resize: none;
+  white-space: pre;
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ========== SIDEBAR ========== -->
+  <div class="sidebar">
+    <div class="app-title">Cylindrical Pillar G-code</div>
+
+    <!-- DXF Input -->
+    <div class="section">
+      <div class="section-title">Profile — DXF</div>
+      <div class="field">
+        <label>DXF content</label>
+        <textarea id="dxfInput" placeholder="Paste DXF file content here…"></textarea>
+      </div>
+      <div class="field">
+        <label>Axis mapping</label>
+        <select id="dxfAxisMap">
+          <option value="XZ_YR">DXF X → machine Z &nbsp;|&nbsp; DXF Y → Radius</option>
+          <option value="XR_YZ" selected>DXF X → Radius &nbsp;|&nbsp; DXF Y → machine Z</option>
+        </select>
+      </div>
+      <div class="sample-link" onclick="loadSample()">Load sample profile</div>
+      <div id="parseError" class="error"></div>
+    </div>
+
+    <!-- Cutting params -->
+    <div class="section">
+      <div class="section-title">Cutting Parameters</div>
+      <div class="row2">
+        <div class="field">
+          <label>Feedrate (mm/min)</label>
+          <input type="number" id="feedrate" value="800" min="1">
+        </div>
+        <div class="field">
+          <label>Spindle (RPM)</label>
+          <input type="number" id="spindleSpeed" value="12000" min="1">
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>Tool radius (mm)</label>
+          <input type="number" id="toolRadius" value="3" min="0" step="0.1">
+        </div>
+        <div class="field">
+          <label>Clearance (mm)</label>
+          <input type="number" id="clearance" value="5" min="0.1" step="0.5">
+        </div>
+      </div>
+    </div>
+
+    <!-- Rotary params -->
+    <div class="section">
+      <div class="section-title">Rotary Parameters</div>
+      <div class="row2">
+        <div class="field">
+          <label>Stock radius (mm)</label>
+          <input type="number" id="stockRadius" value="50" min="1" step="0.5">
+        </div>
+        <div class="field">
+          <label>Stepover (°)</label>
+          <input type="number" id="stepover" value="5" min="0.1" step="0.5" max="360">
+        </div>
+      </div>
+      <div class="row2">
+        <div class="field">
+          <label>4th axis letter</label>
+          <select id="rotaryAxis">
+            <option value="A">A</option>
+            <option value="B">B</option>
+            <option value="C">C</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>X mode</label>
+          <select id="xMode">
+            <option value="radius">Radius</option>
+            <option value="diameter">Diameter</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- Approach -->
+    <div class="section">
+      <div class="section-title">Tool Approach</div>
+      <div class="field">
+        <label>Direction</label>
+        <div class="radio-group">
+          <label class="radio-option">
+            <input type="radio" name="approach" value="radial" checked>
+            <span>Radial (side)</span>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="approach" value="axial">
+            <span>Axial (end)</span>
+          </label>
+        </div>
+      </div>
+      <div class="field" id="axialEntryField" style="display:none">
+        <label>Enter from</label>
+        <select id="axialEntry">
+          <option value="zmin">Profile Z-start (low Z end)</option>
+          <option value="zmax">Profile Z-end (high Z end)</option>
+        </select>
+      </div>
+    </div>
+
+    <button class="btn btn-primary" onclick="generate()">Generate G-code</button>
+    <button class="btn btn-outline" onclick="copyGCode()" id="copyBtn">Copy G-code</button>
+  </div>
+
+  <!-- ========== MAIN ========== -->
+  <div class="main">
+    <div class="preview-panel">
+      <div class="panel-label">Profile Preview</div>
+      <canvas id="previewCanvas"></canvas>
+      <div class="legend">
+        <div class="legend-item">
+          <div class="legend-swatch" style="background:#34d399"></div>
+          <span>Finished profile</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-swatch" style="background:#fbbf24; border-top: 1px dashed #fbbf24; height:0"></div>
+          <span>Tool centre path</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-swatch" style="background:#374151; border-top: 1px dashed #374151; height:0"></div>
+          <span>Stock</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="gcode-panel">
+      <div class="gcode-header">
+        <span class="label">G-code Output</span>
+        <span class="gcode-stats" id="gcodeStats"></span>
+      </div>
+      <textarea id="gcodeOutput" readonly></textarea>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// DXF PARSER  — LWPOLYLINE + old POLYLINE/VERTEX with bulge
+// ============================================================
+function parseDXF(text) {
+  const raw = text.replace(/\r\n|\r/g, '\n').split('\n').map(l => l.trim()).filter(l => l !== '');
+
+  const pairs = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const code = parseInt(raw[i], 10);
+    if (isNaN(code)) { i -= 1; continue; }
+    pairs.push({ code, value: raw[i + 1] });
+  }
+
+  const polylines = [];
+
+  for (let j = 0; j < pairs.length; j++) {
+    // ---- LWPOLYLINE ----
+    if (pairs[j].code === 0 && pairs[j].value === 'LWPOLYLINE') {
+      const rawVerts = []; // [x, y, bulge]
+      let px = null, closed = false;
+
+      for (let k = j + 1; k < pairs.length; k++) {
+        const { code, value } = pairs[k];
+        if (code === 0) break;
+        if (code === 70) closed = (parseInt(value) & 1) === 1;
+        if (code === 10) { px = parseFloat(value); }
+        else if (code === 20 && px !== null) {
+          rawVerts.push([px, parseFloat(value), 0]);
+          px = null;
+        } else if (code === 42 && rawVerts.length > 0) {
+          rawVerts[rawVerts.length - 1][2] = parseFloat(value);
+        }
+      }
+      if (closed && rawVerts.length > 1) rawVerts.push([...rawVerts[0]]);
+      if (rawVerts.length >= 2) polylines.push(tessellateWithBulges(rawVerts));
+    }
+
+    // ---- POLYLINE / VERTEX ----
+    if (pairs[j].code === 0 && pairs[j].value === 'POLYLINE') {
+      const rawVerts = [];
+      for (let k = j + 1; k < pairs.length; k++) {
+        if (pairs[k].code === 0 && pairs[k].value === 'SEQEND') break;
+        if (pairs[k].code === 0 && pairs[k].value === 'VERTEX') {
+          let vx = null, vy = null, vb = 0;
+          for (let m = k + 1; m < pairs.length; m++) {
+            if (pairs[m].code === 0) break;
+            if (pairs[m].code === 10) vx = parseFloat(pairs[m].value);
+            if (pairs[m].code === 20) vy = parseFloat(pairs[m].value);
+            if (pairs[m].code === 42) vb = parseFloat(pairs[m].value);
+          }
+          if (vx !== null && vy !== null) rawVerts.push([vx, vy, vb]);
+        }
+      }
+      if (rawVerts.length >= 2) polylines.push(tessellateWithBulges(rawVerts));
+    }
+  }
+  return polylines;
+}
+
+// ============================================================
+// BULGE TESSELLATION
+// Bulge b on vertex[i] defines the arc from vertex[i] → vertex[i+1].
+// b = tan(θ/4) where θ = included angle (+ = CCW, - = CW, 0 = line).
+// ============================================================
+function tessellateWithBulges(rawVerts) {
+  const result = [];
+
+  for (let i = 0; i < rawVerts.length; i++) {
+    const [x1, y1, b] = rawVerts[i];
+    result.push([x1, y1]);
+
+    if (i < rawVerts.length - 1 && Math.abs(b) > 1e-9) {
+      const [x2, y2] = rawVerts[i + 1];
+      const chordLen = Math.hypot(x2 - x1, y2 - y1);
+      if (chordLen < 1e-12) continue;
+
+      const theta = 4 * Math.atan(Math.abs(b));    // subtended angle [rad]
+      const R     = chordLen / (2 * Math.sin(theta / 2));
+
+      // Midpoint and left-perpendicular of chord
+      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+      const nx = -(y2 - y1) / chordLen;            // left normal x
+      const ny =  (x2 - x1) / chordLen;            // left normal y
+      const distMC = Math.sqrt(Math.max(0, R * R - (chordLen / 2) ** 2));
+
+      // b > 0 (CCW): center is to the left of chord; b < 0 (CW): to the right
+      const s  = Math.sign(b);
+      const cx = mx + s * nx * distMC;
+      const cy = my + s * ny * distMC;
+
+      const a0 = Math.atan2(y1 - cy, x1 - cx);
+      const a1 = Math.atan2(y2 - cy, x2 - cx);
+
+      let sweep = a1 - a0;
+      if (b > 0 && sweep <= 0) sweep += 2 * Math.PI;   // CCW — ensure positive
+      if (b < 0 && sweep >= 0) sweep -= 2 * Math.PI;   // CW  — ensure negative
+
+      // ~5° per segment
+      const nSeg = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 36)));
+      for (let k = 1; k < nSeg; k++) {
+        const a = a0 + (k / nSeg) * sweep;
+        result.push([cx + R * Math.cos(a), cy + R * Math.sin(a)]);
+      }
+    }
+  }
+
+  // Push final vertex (it has no outgoing arc)
+  if (rawVerts.length > 0) {
+    const last = rawVerts[rawVerts.length - 1];
+    result.push([last[0], last[1]]);
+  }
+
+  return result;
+}
+
+// ============================================================
+// AXIS MAPPING — normalise DXF coords to [machineZ, radius]
+// Also takes abs(radius): profiles drawn on the left (negative X) work correctly.
+// ============================================================
+function applyAxisMapping(poly, mode) {
+  // mode: 'XZ_YR' → DXF X=machineZ, Y=R
+  //       'XR_YZ' → DXF X=R,        Y=machineZ
+  return poly.map(([a, b]) =>
+    mode === 'XZ_YR'
+      ? [a, Math.abs(b)]
+      : [b, Math.abs(a)]
+  );
+}
+
+// ============================================================
+// GEOMETRY — left-side tool offset
+// ============================================================
+
+// Returns unit left normal for a segment (p1→p2)
+function segLeftNormal(p1, p2) {
+  const dx = p2[0] - p1[0];
+  const dy = p2[1] - p1[1];
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-12) return [0, 0];
+  return [-dy / len, dx / len]; // rotate tangent 90° CCW
+}
+
+function computeLeftOffset(pts, r) {
+  if (r === 0) return pts.map(p => [p[0], p[1]]);
+  const n = pts.length;
+
+  // Per-vertex averaged normal
+  const normals = pts.map((_, i) => {
+    if (i === 0)     return segLeftNormal(pts[0], pts[1]);
+    if (i === n - 1) return segLeftNormal(pts[n - 2], pts[n - 1]);
+    const na = segLeftNormal(pts[i - 1], pts[i]);
+    const nb = segLeftNormal(pts[i], pts[i + 1]);
+    const nx = na[0] + nb[0], ny = na[1] + nb[1];
+    const len = Math.hypot(nx, ny);
+    return len < 1e-12 ? na : [nx / len, ny / len];
+  });
+
+  return pts.map((p, i) => [p[0] + r * normals[i][0], p[1] + r * normals[i][1]]);
+}
+
+// ============================================================
+// G-CODE GENERATOR
+// ============================================================
+function generateGCode(params, profile) {
+  const {
+    feedrate, spindleSpeed, toolRadius, clearance,
+    stockRadius, stepover, rotaryAxis, xMode,
+    approachType, axialEntry
+  } = params;
+
+  const A    = rotaryAxis;
+  const xFmt = xMode === 'diameter' ? r => (r * 2).toFixed(3) : r => r.toFixed(3);
+  const safeX = xMode === 'diameter'
+    ? ((stockRadius + clearance) * 2).toFixed(3)
+    : (stockRadius + clearance).toFixed(3);
+
+  const offset = computeLeftOffset(profile, toolRadius);
+
+  const zs   = profile.map(p => p[0]);
+  const zMin = Math.min(...zs);
+  const zMax = Math.max(...zs);
+  const safeZ = (zMax + clearance).toFixed(3);
+
+  const numPasses = Math.ceil(360 / stepover);
+
+  // For axial approach: which end to enter from
+  const enterFromZMin = axialEntry === 'zmin'; // true → enter from low-Z side
+  const entryZ  = (enterFromZMin ? zMin - clearance : zMax + clearance).toFixed(3);
+
+  const L = []; // lines
+  const l = s => L.push(s);
+
+  l('; =========================================');
+  l('; Cylindrical Pillar G-code');
+  l(`; Tool radius    : ${toolRadius} mm`);
+  l(`; Stock radius   : ${stockRadius} mm`);
+  l(`; Stepover       : ${stepover}°  (${numPasses} passes)`);
+  l(`; Approach       : ${approachType === 'radial' ? 'Radial (side)' : `Axial (${enterFromZMin ? 'low-Z end' : 'high-Z end'})`}`);
+  l(`; X mode         : ${xMode}`);
+  l('; =========================================');
+  l('');
+  l('G21          ; metric');
+  l('G90          ; absolute');
+  l('G94          ; feed per minute');
+  l(`S${spindleSpeed} M3    ; spindle on`);
+  l(`G0 X${safeX} Z${safeZ} ${A}0.000  ; safe home`);
+  l('');
+
+  for (let pass = 0; pass < numPasses; pass++) {
+    const angle = (pass * stepover).toFixed(3);
+
+    l(`; --- Pass ${String(pass + 1).padStart(3)} / ${numPasses}  |  ${A} = ${angle}° ---`);
+    l(`G0 ${A}${angle}`);
+
+    if (approachType === 'radial') {
+      // ---- RADIAL APPROACH ----
+      // 1. Rapid to first Z at safe radius
+      // 2. Feed radially in to first offset point
+      const [fz, fr] = offset[0];
+      l(`G0 Z${fz.toFixed(3)} X${safeX}`);
+      l(`G1 X${xFmt(fr)} F${feedrate}  ; radial plunge`);
+
+      // Follow profile
+      for (const [z, r] of offset) {
+        l(`G1 Z${z.toFixed(3)} X${xFmt(r)} F${feedrate}`);
+      }
+      l(`G0 X${safeX}  ; retract`);
+
+    } else {
+      // ---- AXIAL APPROACH ----
+      // Determine profile direction to traverse
+      const trav = enterFromZMin ? offset : [...offset].reverse();
+      const [fz, fr] = trav[0];
+
+      // 1. Rapid to first profile radius at entry Z
+      l(`G0 X${xFmt(fr)} Z${entryZ}`);
+      // 2. Feed axially to first profile point
+      l(`G1 Z${fz.toFixed(3)} F${feedrate}  ; axial entry`);
+
+      // Follow profile
+      for (const [z, r] of trav) {
+        l(`G1 Z${z.toFixed(3)} X${xFmt(r)} F${feedrate}`);
+      }
+
+      // Retract axially then radially
+      const exitZ = (enterFromZMin ? zMax + clearance : zMin - clearance).toFixed(3);
+      l(`G1 Z${exitZ} F${feedrate}  ; axial exit`);
+      l(`G0 X${safeX}  ; retract`);
+    }
+
+    l('');
+  }
+
+  l('; =========================================');
+  l('M5           ; spindle off');
+  l(`G0 X${safeX} Z${safeZ}`);
+  l('M30');
+
+  return L.join('\n');
+}
+
+// ============================================================
+// CANVAS PREVIEW
+// ============================================================
+function resizeCanvas(canvas) {
+  const r = canvas.parentElement.getBoundingClientRect();
+  canvas.width  = r.width;
+  canvas.height = r.height;
+}
+
+function drawPreview(canvas, profile, offset, stockRadius) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!profile || profile.length < 2) {
+    ctx.fillStyle = '#374151';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Paste DXF content and click Generate to preview', W / 2, H / 2);
+    return;
+  }
+
+  const all = [...profile, ...offset];
+  const xs  = all.map(p => p[0]);
+  const ys  = all.map(p => p[1]);
+  const xlo = Math.min(...xs), xhi = Math.max(...xs);
+  const ylo = Math.min(Math.min(...ys), 0);
+  const yhi = Math.max(Math.max(...ys), stockRadius * 1.05);
+
+  const pad   = 48;
+  const scaleX = (W - pad * 2) / (xhi - xlo || 1);
+  const scaleY = (H - pad * 2) / (yhi - ylo || 1);
+  const sc     = Math.min(scaleX, scaleY);
+  const ox     = pad + ((W - pad * 2) - (xhi - xlo) * sc) / 2;
+  const oy     = pad + ((H - pad * 2) - (yhi - ylo) * sc) / 2;
+
+  const tx = x => ox + (x - xlo) * sc;
+  const ty = y => H - oy - (y - ylo) * sc;
+
+  // Grid: axis lines
+  ctx.strokeStyle = '#1f2937';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, ty(0)); ctx.lineTo(W, ty(0)); ctx.stroke(); // R=0
+  ctx.beginPath(); ctx.moveTo(tx(xlo - 5), ty(0)); ctx.lineTo(tx(xhi + 5), ty(0)); ctx.stroke();
+
+  // Stock radius dashed line
+  ctx.strokeStyle = '#374151';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 5]);
+  ctx.beginPath();
+  ctx.moveTo(tx(xlo - 3), ty(stockRadius));
+  ctx.lineTo(tx(xhi + 3), ty(stockRadius));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Tool path (offset) — dashed amber
+  ctx.strokeStyle = '#fbbf24';
+  ctx.lineWidth   = 1.5;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  offset.forEach(([z, r], i) => i === 0 ? ctx.moveTo(tx(z), ty(r)) : ctx.lineTo(tx(z), ty(r)));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Profile — solid green
+  ctx.strokeStyle = '#34d399';
+  ctx.lineWidth   = 2;
+  ctx.beginPath();
+  profile.forEach(([z, r], i) => i === 0 ? ctx.moveTo(tx(z), ty(r)) : ctx.lineTo(tx(z), ty(r)));
+  ctx.stroke();
+
+  // Vertex dots
+  ctx.fillStyle = '#34d399';
+  profile.forEach(([z, r]) => {
+    ctx.beginPath();
+    ctx.arc(tx(z), ty(r), 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // Axis labels
+  ctx.fillStyle = '#4b5563';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('R', tx(xlo) - 4, ty((yhi + ylo) / 2));
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('Z', tx((xhi + xlo) / 2), H - oy + 4);
+}
+
+// ============================================================
+// STATE & EVENTS
+// ============================================================
+let state = { profile: null, offset: null };
+
+document.querySelectorAll('input[name="approach"]').forEach(r =>
+  r.addEventListener('change', () => {
+    const axial = document.querySelector('input[name="approach"]:checked').value === 'axial';
+    document.getElementById('axialEntryField').style.display = axial ? 'block' : 'none';
+  })
+);
+
+function getParams() {
+  return {
+    feedrate:     parseFloat(document.getElementById('feedrate').value)     || 800,
+    spindleSpeed: parseInt(document.getElementById('spindleSpeed').value)    || 12000,
+    toolRadius:   parseFloat(document.getElementById('toolRadius').value)    || 0,
+    clearance:    parseFloat(document.getElementById('clearance').value)     || 5,
+    stockRadius:  parseFloat(document.getElementById('stockRadius').value)   || 50,
+    stepover:     parseFloat(document.getElementById('stepover').value)      || 5,
+    rotaryAxis:   document.getElementById('rotaryAxis').value,
+    xMode:        document.getElementById('xMode').value,
+    approachType: document.querySelector('input[name="approach"]:checked').value,
+    axialEntry:   document.getElementById('axialEntry').value,
+    dxfAxisMap:   document.getElementById('dxfAxisMap').value,
+  };
+}
+
+function generate() {
+  const errEl = document.getElementById('parseError');
+  errEl.classList.remove('show');
+
+  const dxf = document.getElementById('dxfInput').value.trim();
+  if (!dxf) {
+    errEl.textContent = 'Paste DXF content first.';
+    errEl.classList.add('show');
+    return;
+  }
+
+  let polys;
+  try { polys = parseDXF(dxf); }
+  catch (e) {
+    errEl.textContent = 'Parse error: ' + e.message;
+    errEl.classList.add('show');
+    return;
+  }
+
+  if (!polys.length) {
+    errEl.textContent = 'No LWPOLYLINE or POLYLINE found in DXF.';
+    errEl.classList.add('show');
+    return;
+  }
+
+  // Use longest polyline, then normalise axes + radius sign
+  const params  = getParams();
+  const rawPoly = polys.reduce((a, b) => b.length > a.length ? b : a);
+  const profile = applyAxisMapping(rawPoly, params.dxfAxisMap);
+  const offset  = computeLeftOffset(profile, params.toolRadius);
+
+  state = { profile, offset, params };
+
+  const gcode = generateGCode(params, profile);
+  document.getElementById('gcodeOutput').value = gcode;
+
+  const lines = gcode.split('\n').length;
+  const passes = Math.ceil(360 / params.stepover);
+  const rawPts = polys.reduce((a, b) => b.length > a.length ? b : a).length;
+  document.getElementById('gcodeStats').textContent =
+    `${lines} lines · ${passes} passes · ${rawPts} DXF pts → ${profile.length} after tessellation`;
+
+  // Redraw canvas
+  const canvas = document.getElementById('previewCanvas');
+  resizeCanvas(canvas);
+  drawPreview(canvas, profile, offset, params.stockRadius);
+}
+
+async function copyGCode() {
+  const txt = document.getElementById('gcodeOutput').value;
+  if (!txt) return;
+  try {
+    await navigator.clipboard.writeText(txt);
+    const btn = document.getElementById('copyBtn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy G-code'; }, 1600);
+  } catch (_) {}
+}
+
+// ============================================================
+// SAMPLE DXF — simple vase-like pillar profile
+// ============================================================
+// Sample uses DXF X=Radius, Y=Z (same convention as Pillar.dxf)
+const SAMPLE_DXF = `  0
+SECTION
+  2
+ENTITIES
+  0
+LWPOLYLINE
+  8
+0
+ 90
+9
+ 70
+0
+ 10
+-48.0
+ 20
+0.0
+ 10
+-44.0
+ 20
+20.0
+ 10
+-36.0
+ 20
+40.0
+ 10
+-32.0
+ 20
+60.0
+ 10
+-35.0
+ 20
+80.0
+ 10
+-40.0
+ 20
+100.0
+ 10
+-44.0
+ 20
+120.0
+ 10
+-47.0
+ 20
+140.0
+ 10
+-48.0
+ 20
+160.0
+  0
+ENDSEC
+  0
+EOF`;
+
+function loadSample() {
+  document.getElementById('dxfInput').value = SAMPLE_DXF;
+}
+
+// ============================================================
+// INIT
+// ============================================================
+window.addEventListener('load', () => {
+  const canvas = document.getElementById('previewCanvas');
+  resizeCanvas(canvas);
+  drawPreview(canvas, null, null, 50);
+});
+
+window.addEventListener('resize', () => {
+  const canvas = document.getElementById('previewCanvas');
+  resizeCanvas(canvas);
+  if (state.profile) {
+    drawPreview(canvas, state.profile, state.offset, state.params.stockRadius);
+  } else {
+    drawPreview(canvas, null, null, parseFloat(document.getElementById('stockRadius').value) || 50);
+  }
+});
+</script>
+</body>
+</html>
