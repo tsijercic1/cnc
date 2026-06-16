@@ -2,7 +2,7 @@
 
 Generates G-code for **cylindrical pillar turning / carving** on a 3-axis CNC with a 4th rotary axis. The tool follows a 2D profile while the rotary axis indexes through 360°.
 
-_Last updated: 2026-06-16 rev 3_
+_Last updated: 2026-06-16 rev 4_
 
 ---
 
@@ -37,6 +37,10 @@ The default matches the `Pillar.dxf` reference file (AutoCAD R12 / AC1009 format
 | X mode | `xMode` | — | `radius` → X values are radii. `diameter` → X values are doubled (lathe diameter convention). |
 | Approach direction | `approach` (radio) | — | `radial` (side) or `axial` (end). |
 | Axial entry from | `axialEntry` | — | Only active when approach = axial. `zmin` = enter from low-Z end; `zmax` = enter from high-Z end. |
+| Enable roughing | `roughingEnabled` | — | When checked, emits multiple radial passes per angle before the finish pass. |
+| Pass depth | `passDepth` | mm | Radial depth of each roughing pass. |
+| Finish allowance | `finishAllowance` | mm | Material left on the profile after all roughing passes. |
+| Include finishing | `includeFinishing` | — | When checked (default), a final pass at the true offset profile follows the roughing passes. |
 
 ---
 
@@ -86,6 +90,29 @@ When entering from the high-Z end, the profile is traversed in reverse (last poi
 
 ---
 
+## Roughing Operation
+
+When roughing is enabled the generator computes:
+
+```
+maxDepth = stockRadius − minProfileR − finishAllowance
+N = max(0, ceil(maxDepth / passDepth))
+```
+
+where `minProfileR` is the smallest radius value across all profile segments (the deepest cut point).
+
+For each A-axis angle, the passes are emitted in order:
+
+1. Roughing pass k=1 — outermost: offset = `toolRadius + finishAllowance + (N−1)×passDepth`
+2. Roughing pass k=2: offset = `toolRadius + finishAllowance + (N−2)×passDepth`
+3. …
+4. Roughing pass k=N — innermost: offset = `toolRadius + finishAllowance`
+5. Finishing pass (if **Include finishing** checked): offset = `toolRadius`
+
+Each pass uses the same approach/retract sequence (radial or axial) as the finishing pass.
+
+---
+
 ## G-code Structure
 
 ```gcode
@@ -97,11 +124,11 @@ G18          ; XZ plane — required for G2/G3 arc moves
 S{spindleSpeed} M3
 G0 X{safe_X} Z{safe_Z} A0.000
 
-; for each pass (angle = 0, stepover, 2×stepover, …):
+; for each angle (0, stepover, 2×stepover, …):
 ;   G0 A{angle}
-;   approach move
-;   G1 / G2 / G3 profile segments
-;   retract
+;   [roughing passes — approach, profile at offset, retract]  ← only when roughing enabled
+;   [finishing pass  — approach, profile at toolRadius offset, retract]
+;   (blank line)
 
 M5
 G0 X{safe_X} Z{safe_Z}
@@ -168,6 +195,6 @@ Axes: Z horizontal, R vertical. Canvas auto-resizes with the window.
 
 - Non-tangent transitions between line and arc segments produce small position discontinuities at junctions. CAD profiles designed with tangent continuity (as `Pillar.dxf` is) are not affected.
 - G2/G3 arcs require the machine controller to support **G18** (XZ plane). Most FANUC-compatible and Haas controllers do; verify before running.
-- No roughing passes — a single finish pass per angle. Run multiple times with increasing depth, or offset the stock radius inward manually to simulate roughing.
+- Roughing pass count is computed from `minProfileR` (the globally shallowest radius on the profile). If the profile is non-uniform, some areas may see more air passes than necessary; this is conservative and safe.
 - Assumes a symmetric cylindrical stock (constant radius along Z).
 - No collision detection — if the offset profile radius exceeds the stock radius at any point, the generated G-code will air-cut or gouge, depending on direction.

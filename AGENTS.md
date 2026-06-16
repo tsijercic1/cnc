@@ -61,6 +61,14 @@ All G-code is metric (G21), absolute (G90), feed per minute (G94).
 - Always include a canvas preview showing: finished profile (green solid), tool centre path (amber dashed), stock radius line (grey dashed).
 - Include a "Load sample" shortcut so the tool can be tested without a real DXF.
 
+### Roughing operation (pillar-gcode-gen)
+- Enabled by `roughingEnabled` checkbox; controlled by `passDepth` and `finishAllowance`.
+- Pass count `N = max(0, ceil((stockRadius − minProfileR − finishAllowance) / passDepth))`.
+- `minProfileR` = minimum R across all segment endpoints — the globally deepest cut.
+- Roughing passes emitted outermost-first (k=1..N), each using `offsetSegments(segs, toolRadius + finishAllowance + (N−k)*passDepth)`.
+- Finishing pass follows if `includeFinishing` is true (it can be disabled to leave material for a separate tool pass).
+- Each roughing pass uses the same approach/retract sequence as the finishing pass.
+
 ### Documentation
 - Every tool has a corresponding `docs/<tool-name>.md`.
 - **Update `docs/<tool-name>.md` and this file whenever the tool changes.**

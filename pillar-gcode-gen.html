@@ -327,6 +327,35 @@ select option { background: #1f2937; }
       </div>
     </div>
 
+    <!-- Roughing -->
+    <div class="section">
+      <div class="section-title">Roughing</div>
+      <div class="field">
+        <label class="radio-option">
+          <input type="checkbox" id="roughingEnabled">
+          <span>Enable roughing passes</span>
+        </label>
+      </div>
+      <div id="roughingParams" style="display:none">
+        <div class="row2">
+          <div class="field">
+            <label>Pass depth (mm)</label>
+            <input type="number" id="passDepth" value="2" min="0.1" step="0.1">
+          </div>
+          <div class="field">
+            <label>Finish allowance (mm)</label>
+            <input type="number" id="finishAllowance" value="0.5" min="0" step="0.1">
+          </div>
+        </div>
+        <div class="field">
+          <label class="radio-option">
+            <input type="checkbox" id="includeFinishing" checked>
+            <span>Include finishing pass</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
     <!-- Approach -->
     <div class="section">
       <div class="section-title">Tool Approach</div>
@@ -574,30 +603,33 @@ function generateGCode(params, segs) {
   const {
     feedrate, spindleSpeed, toolRadius, clearance,
     stockRadius, stepover, rotaryAxis, xMode,
-    approachType, axialEntry
+    approachType, axialEntry,
+    roughingEnabled, passDepth, finishAllowance, includeFinishing,
   } = params;
 
   const A     = rotaryAxis;
-  // X mode: endpoint coordinates only. I/K arc offsets always in radius.
   const xFmt  = xMode === 'diameter' ? r => (r * 2).toFixed(3) : r => r.toFixed(3);
   const safeX = xMode === 'diameter'
     ? ((stockRadius + clearance) * 2).toFixed(3)
     : (stockRadius + clearance).toFixed(3);
-
-  const offSegs = offsetSegments(segs, toolRadius);
-  if (!offSegs.length) return '; ERROR: no valid segments after offset';
 
   const allZ  = segs.flatMap(s => [s.z1, s.z2]);
   const zMin  = Math.min(...allZ);
   const zMax  = Math.max(...allZ);
   const safeZ = (zMax + clearance).toFixed(3);
 
-  const numPasses = Math.ceil(360 / stepover);
+  const numAngles     = Math.ceil(360 / stepover);
   const enterFromZMin = axialEntry === 'zmin';
   const entryZ = (enterFromZMin ? zMin - clearance : zMax + clearance).toFixed(3);
   const exitZ  = (enterFromZMin ? zMax + clearance : zMin - clearance).toFixed(3);
 
-  const arcCount  = segs.filter(s => s.type === 'arc').length;
+  // ---- Roughing pass count ----
+  // The deepest point of the profile needs the most roughing passes.
+  const minProfileR = Math.min(...segs.flatMap(s => [s.r1, s.r2]));
+  const maxDepth    = stockRadius - minProfileR - (roughingEnabled ? finishAllowance : 0);
+  const N = roughingEnabled ? Math.max(0, Math.ceil(maxDepth / passDepth)) : 0;
+
+  const arcCount = segs.filter(s => s.type === 'arc').length;
 
   const L = [];
   const l = s => L.push(s);
@@ -606,8 +638,11 @@ function generateGCode(params, segs) {
   l('; Cylindrical Pillar G-code');
   l(`; Tool radius    : ${toolRadius} mm`);
   l(`; Stock radius   : ${stockRadius} mm`);
-  l(`; Stepover       : ${stepover}°  (${numPasses} passes)`);
+  l(`; Stepover       : ${stepover}°  (${numAngles} angles)`);
   l(`; Segments       : ${segs.length - arcCount} lines + ${arcCount} arcs`);
+  if (roughingEnabled) {
+    l(`; Roughing       : ${N} pass${N !== 1 ? 'es' : ''} × ${passDepth} mm  |  finish allowance ${finishAllowance} mm`);
+  }
   l(`; Approach       : ${approachType === 'radial' ? 'Radial (side)' : `Axial (${enterFromZMin ? 'low-Z' : 'high-Z'} entry)`}`);
   l(`; X mode         : ${xMode}`);
   l('; =========================================');
@@ -620,13 +655,11 @@ function generateGCode(params, segs) {
   l(`G0 X${safeX} Z${safeZ} ${A}0.000  ; safe home`);
   l('');
 
-  // Helper: emit a segment as G-code (G1 / G2 / G3)
+  // ---- Emit one segment ----
   function emitSeg(seg) {
     if (seg.type === 'line') {
       l(`G1 Z${seg.z2.toFixed(3)} X${xFmt(seg.r2)} F${feedrate}`);
     } else {
-      // I = center_R - start_R  (X offset, always radius)
-      // K = center_Z - start_Z
       const I   = (seg.cr - seg.r1).toFixed(3);
       const K   = (seg.cz - seg.z1).toFixed(3);
       const cmd = seg.ccw ? 'G3' : 'G2';
@@ -634,17 +667,14 @@ function generateGCode(params, segs) {
     }
   }
 
-  for (let pass = 0; pass < numPasses; pass++) {
-    const angle = (pass * stepover).toFixed(3);
-    l(`; --- Pass ${String(pass + 1).padStart(3)} / ${numPasses}  |  ${A} = ${angle}° ---`);
-    l(`G0 ${A}${angle}`);
-
+  // ---- Emit one profile pass (approach → follow → retract) ----
+  function emitPass(offS, label) {
     const trav = (approachType === 'axial' && !enterFromZMin)
-      ? reverseSegments(offSegs)
-      : offSegs;
-
+      ? reverseSegments(offS)
+      : offS;
     const first = trav[0];
 
+    l(`; ${label}`);
     if (approachType === 'radial') {
       l(`G0 Z${first.z1.toFixed(3)} X${safeX}`);
       l(`G1 X${xFmt(first.r1)} F${feedrate}  ; radial plunge`);
@@ -657,6 +687,31 @@ function generateGCode(params, segs) {
       l(`G1 Z${exitZ} F${feedrate}  ; axial exit`);
       l(`G0 X${safeX}  ; retract`);
     }
+  }
+
+  // ---- Main loop — one A-axis angle at a time ----
+  for (let ai = 0; ai < numAngles; ai++) {
+    const angle = (ai * stepover).toFixed(3);
+    l(`; === Angle ${String(ai + 1).padStart(3)} / ${numAngles}  |  ${A} = ${angle}° ===`);
+    l(`G0 ${A}${angle}`);
+
+    // Roughing passes: k = 1 (outermost) … N (innermost, leaves finishAllowance)
+    for (let k = 1; k <= N; k++) {
+      const addlOffset = finishAllowance + (N - k) * passDepth;
+      const roughSegs  = offsetSegments(segs, toolRadius + addlOffset);
+      if (roughSegs.length) {
+        emitPass(roughSegs, `Roughing pass ${k}/${N}  offset +${addlOffset.toFixed(3)} mm`);
+      }
+    }
+
+    // Finishing pass
+    if (!roughingEnabled || includeFinishing) {
+      const finSegs = offsetSegments(segs, toolRadius);
+      if (finSegs.length) {
+        emitPass(finSegs, roughingEnabled ? 'Finishing pass' : 'Pass');
+      }
+    }
+
     l('');
   }
 
@@ -677,7 +732,8 @@ function resizeCanvas(canvas) {
   canvas.height = r.height;
 }
 
-function drawPreview(canvas, segs, offSegs, stockRadius) {
+// roughingSegArrays: array of segment arrays, one per roughing pass (outermost first)
+function drawPreview(canvas, segs, offSegs, stockRadius, roughingSegArrays) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
@@ -693,14 +749,17 @@ function drawPreview(canvas, segs, offSegs, stockRadius) {
     return;
   }
 
-  // Compute bounds from all segment endpoints and arc centres
+  const roughArrays = roughingSegArrays || [];
+
+  // Compute bounds from all segment endpoints, arc centres, and roughing paths
   const pts = segs.flatMap(s =>
     s.type === 'arc'
       ? [[s.z1, s.r1], [s.z2, s.r2], [s.cz, s.cr]]
       : [[s.z1, s.r1], [s.z2, s.r2]]
   );
   const offPts = offSegs.flatMap(s => [[s.z1, s.r1], [s.z2, s.r2]]);
-  const allPts = [...pts, ...offPts];
+  const roughPts = roughArrays.flatMap(arr => arr.flatMap(s => [[s.z1, s.r1], [s.z2, s.r2]]));
+  const allPts = [...pts, ...offPts, ...roughPts];
   const zlo = Math.min(...allPts.map(p => p[0]));
   const zhi = Math.max(...allPts.map(p => p[0]));
   const rlo = Math.min(Math.min(...allPts.map(p => p[1])), 0);
@@ -722,12 +781,9 @@ function drawPreview(canvas, segs, offSegs, stockRadius) {
     if (seg.type === 'line') {
       ctx.lineTo(tx(seg.z2), ty(seg.r2));
     } else {
-      // Canvas arc: angles in screen space (Y inverted relative to math space)
-      // startAngle in canvas space: atan2(-(r1-cr), z1-cz)
       const sa = Math.atan2(-(seg.r1 - seg.cr), seg.z1 - seg.cz);
       const ea = Math.atan2(-(seg.r2 - seg.cr), seg.z2 - seg.cz);
       const R  = seg.R * sc;
-      // ccw in machine (G3) → CW in canvas (y-axis inverted) → anticlockwise=false
       ctx.arc(tx(seg.cz), ty(seg.cr), R, sa, ea, !seg.ccw);
     }
   }
@@ -749,7 +805,28 @@ function drawPreview(canvas, segs, offSegs, stockRadius) {
   ctx.moveTo(0, ty(0)); ctx.lineTo(W, ty(0));
   ctx.stroke();
 
-  // Offset (tool centre path) — dashed amber
+  // Roughing pass tool-centre paths — graduated colour: outermost (dim) → innermost (brighter)
+  // Each pass is a solid line; colour fades from near-stock grey toward amber as passes approach finish
+  const N = roughArrays.length;
+  roughArrays.forEach((arr, k) => {
+    if (!arr.length) return;
+    // k=0 outermost → k=N-1 innermost (closest to finish)
+    const t = N <= 1 ? 1 : k / (N - 1);              // 0 = outermost, 1 = innermost
+    // interpolate: #4b5563 (grey) → #f59e0b (warm amber, distinct from finish amber)
+    const r = Math.round(0x4b + t * (0xf5 - 0x4b));
+    const g = Math.round(0x55 + t * (0x9e - 0x55));
+    const b = Math.round(0x63 + t * (0x0b - 0x63));
+    const alpha = 0.35 + t * 0.35;                    // 0.35 → 0.70
+    ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    arr.forEach((s, i) => drawSeg(s, i === 0));
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // Finish tool-centre path (offset by toolRadius) — dashed amber
   ctx.strokeStyle = '#fbbf24';
   ctx.lineWidth   = 1.5;
   ctx.setLineDash([4, 4]);
@@ -771,6 +848,32 @@ function drawPreview(canvas, segs, offSegs, stockRadius) {
     if (i === 0) { ctx.beginPath(); ctx.arc(tx(s.z1), ty(s.r1), 2.5, 0, Math.PI*2); ctx.fill(); }
     ctx.beginPath(); ctx.arc(tx(s.z2), ty(s.r2), 2.5, 0, Math.PI*2); ctx.fill();
   });
+
+  // Legend (only when roughing passes are shown)
+  if (N > 0) {
+    const items = [
+      { color: '#34d399',           dash: false, label: 'Profile' },
+      { color: 'rgba(245,158,11,0.7)', dash: true,  label: `Roughing (${N} pass${N !== 1 ? 'es' : ''})` },
+      { color: '#fbbf24',           dash: true,  label: 'Finish path' },
+    ];
+    ctx.font = '10px sans-serif';
+    ctx.textBaseline = 'middle';
+    let lx = tx(zlo);
+    const ly = ty(rhi) + 10;
+    items.forEach(item => {
+      ctx.strokeStyle = item.color;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash(item.dash ? [4, 3] : []);
+      ctx.beginPath();
+      ctx.moveTo(lx, ly); ctx.lineTo(lx + 18, ly);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = item.color;
+      ctx.textAlign = 'left';
+      ctx.fillText(item.label, lx + 22, ly);
+      lx += ctx.measureText(item.label).width + 48;
+    });
+  }
 
   // Axis labels
   ctx.fillStyle    = '#4b5563';
@@ -795,6 +898,10 @@ document.querySelectorAll('input[name="approach"]').forEach(r =>
   })
 );
 
+document.getElementById('roughingEnabled').addEventListener('change', function () {
+  document.getElementById('roughingParams').style.display = this.checked ? 'block' : 'none';
+});
+
 function getParams() {
   return {
     feedrate:     parseFloat(document.getElementById('feedrate').value)     || 800,
@@ -805,9 +912,13 @@ function getParams() {
     stepover:     parseFloat(document.getElementById('stepover').value)      || 5,
     rotaryAxis:   document.getElementById('rotaryAxis').value,
     xMode:        document.getElementById('xMode').value,
-    approachType: document.querySelector('input[name="approach"]:checked').value,
-    axialEntry:   document.getElementById('axialEntry').value,
-    dxfAxisMap:   document.getElementById('dxfAxisMap').value,
+    approachType:      document.querySelector('input[name="approach"]:checked').value,
+    axialEntry:        document.getElementById('axialEntry').value,
+    dxfAxisMap:        document.getElementById('dxfAxisMap').value,
+    roughingEnabled:   document.getElementById('roughingEnabled').checked,
+    passDepth:         parseFloat(document.getElementById('passDepth').value)       || 2,
+    finishAllowance:   parseFloat(document.getElementById('finishAllowance').value) || 0.5,
+    includeFinishing:  document.getElementById('includeFinishing').checked,
   };
 }
 
@@ -834,7 +945,20 @@ function generate() {
   const segs       = buildSegments(mappedVerts);
   const offSegs    = offsetSegments(segs, params.toolRadius);
 
-  state = { segs, offSegs, params };
+  // Build roughing pass segment arrays for preview
+  let roughingSegArrays = [];
+  if (params.roughingEnabled) {
+    const minProfileR = Math.min(...segs.flatMap(s => [s.r1, s.r2]));
+    const maxDepth    = params.stockRadius - minProfileR - params.finishAllowance;
+    const N = Math.max(0, Math.ceil(maxDepth / params.passDepth));
+    for (let k = 1; k <= N; k++) {
+      const addlOffset = params.finishAllowance + (N - k) * params.passDepth;
+      const arr = offsetSegments(segs, params.toolRadius + addlOffset);
+      roughingSegArrays.push(arr);
+    }
+  }
+
+  state = { segs, offSegs, params, roughingSegArrays };
 
   const gcode = generateGCode(params, segs);
   document.getElementById('gcodeOutput').value = gcode;
@@ -843,12 +967,14 @@ function generate() {
   const passes     = Math.ceil(360 / params.stepover);
   const lineSegs   = segs.filter(s => s.type === 'line').length;
   const arcSegs    = segs.filter(s => s.type === 'arc').length;
+  const roughN     = roughingSegArrays.length;
   document.getElementById('gcodeStats').textContent =
-    `${gcodeLines} lines · ${passes} passes · ${rawPoly.length} DXF pts → ${lineSegs}L + ${arcSegs}A segments`;
+    `${gcodeLines} lines · ${passes} passes · ${rawPoly.length} DXF pts → ${lineSegs}L + ${arcSegs}A segments`
+    + (roughN ? ` · ${roughN} roughing pass${roughN !== 1 ? 'es' : ''}` : '');
 
   const canvas = document.getElementById('previewCanvas');
   resizeCanvas(canvas);
-  drawPreview(canvas, segs, offSegs, params.stockRadius);
+  drawPreview(canvas, segs, offSegs, params.stockRadius, roughingSegArrays);
 }
 
 async function copyGCode() {
@@ -929,7 +1055,7 @@ window.addEventListener('resize', () => {
   const canvas = document.getElementById('previewCanvas');
   resizeCanvas(canvas);
   if (state.segs) {
-    drawPreview(canvas, state.segs, state.offSegs, state.params.stockRadius);
+    drawPreview(canvas, state.segs, state.offSegs, state.params.stockRadius, state.roughingSegArrays);
   } else {
     drawPreview(canvas, null, null, parseFloat(document.getElementById('stockRadius').value) || 50);
   }
