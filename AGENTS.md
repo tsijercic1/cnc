@@ -39,8 +39,15 @@ All G-code is metric (G21), absolute (G90), feed per minute (G94).
 - Accept LWPOLYLINE (preferred) and old POLYLINE/VERTEX (AC1009) format.
 - Axis mapping is **user-selectable**: `XR_YZ` (default, matches `Pillar.dxf`) or `XZ_YR`. Always expose this as a UI dropdown.
 - Take `abs()` of the radius coordinate — profiles drawn on the left side of the centreline have negative X.
-- **Arc bulges** (DXF group code 42 on VERTEX or LWPOLYLINE vertex): tessellate to ~5° linear segments. Never silently drop bulge values.
+- **Arc bulges** (DXF group code 42): parsed on both entity formats. Never silently drop them.
 - Use the longest polyline found if multiple exist.
+
+### Arc segments (G2/G3)
+- Output arc bulges as G2/G3, not tessellated G1 moves.
+- `G18` (XZ plane) must appear in the G-code header before any arc moves.
+- Arc direction: computed from cross-product of (centre→start) × (centre→end) in machine XZ space. This automatically corrects for the axis-mapping reflection (abs of radius reverses DXF CCW↔CW).
+- Tool offset on arcs: same centre, R ± toolRadius (+ for G3/CCW, − for G2/CW). Degenerate arcs (R ≤ 0 after offset) are dropped.
+- `I` = center_R − start_R; `K` = center_Z − start_Z. `I` is always radius, even in diameter mode.
 
 ### Tool radius compensation
 - Computed **manually** (no G41/G42 in output) — tool centre is offset from the finished profile.

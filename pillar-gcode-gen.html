@@ -390,6 +390,7 @@ select option { background: #1f2937; }
 <script>
 // ============================================================
 // DXF PARSER  — LWPOLYLINE + old POLYLINE/VERTEX with bulge
+// Returns raw DXF vertices: [[dxf_x, dxf_y, bulge], ...]
 // ============================================================
 function parseDXF(text) {
   const raw = text.replace(/\r\n|\r/g, '\n').split('\n').map(l => l.trim()).filter(l => l !== '');
@@ -406,9 +407,8 @@ function parseDXF(text) {
   for (let j = 0; j < pairs.length; j++) {
     // ---- LWPOLYLINE ----
     if (pairs[j].code === 0 && pairs[j].value === 'LWPOLYLINE') {
-      const rawVerts = []; // [x, y, bulge]
+      const rawVerts = [];
       let px = null, closed = false;
-
       for (let k = j + 1; k < pairs.length; k++) {
         const { code, value } = pairs[k];
         if (code === 0) break;
@@ -422,7 +422,7 @@ function parseDXF(text) {
         }
       }
       if (closed && rawVerts.length > 1) rawVerts.push([...rawVerts[0]]);
-      if (rawVerts.length >= 2) polylines.push(tessellateWithBulges(rawVerts));
+      if (rawVerts.length >= 2) polylines.push(rawVerts);
     }
 
     // ---- POLYLINE / VERTEX ----
@@ -441,143 +441,165 @@ function parseDXF(text) {
           if (vx !== null && vy !== null) rawVerts.push([vx, vy, vb]);
         }
       }
-      if (rawVerts.length >= 2) polylines.push(tessellateWithBulges(rawVerts));
+      if (rawVerts.length >= 2) polylines.push(rawVerts);
     }
   }
   return polylines;
 }
 
 // ============================================================
-// BULGE TESSELLATION
-// Bulge b on vertex[i] defines the arc from vertex[i] → vertex[i+1].
-// b = tan(θ/4) where θ = included angle (+ = CCW, - = CW, 0 = line).
+// AXIS MAPPING — normalise DXF coords to [machineZ, radius, bulge]
+// abs(radius): profiles drawn on the left (negative X) work correctly.
+// Note: abs() is a reflection of the radius axis — this reverses arc
+// direction, which is handled in buildSegments via cross-product.
 // ============================================================
-function tessellateWithBulges(rawVerts) {
-  const result = [];
-
-  for (let i = 0; i < rawVerts.length; i++) {
-    const [x1, y1, b] = rawVerts[i];
-    result.push([x1, y1]);
-
-    if (i < rawVerts.length - 1 && Math.abs(b) > 1e-9) {
-      const [x2, y2] = rawVerts[i + 1];
-      const chordLen = Math.hypot(x2 - x1, y2 - y1);
-      if (chordLen < 1e-12) continue;
-
-      const theta = 4 * Math.atan(Math.abs(b));    // subtended angle [rad]
-      const R     = chordLen / (2 * Math.sin(theta / 2));
-
-      // Midpoint and left-perpendicular of chord
-      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-      const nx = -(y2 - y1) / chordLen;            // left normal x
-      const ny =  (x2 - x1) / chordLen;            // left normal y
-      const distMC = Math.sqrt(Math.max(0, R * R - (chordLen / 2) ** 2));
-
-      // b > 0 (CCW): center is to the left of chord; b < 0 (CW): to the right
-      const s  = Math.sign(b);
-      const cx = mx + s * nx * distMC;
-      const cy = my + s * ny * distMC;
-
-      const a0 = Math.atan2(y1 - cy, x1 - cx);
-      const a1 = Math.atan2(y2 - cy, x2 - cx);
-
-      let sweep = a1 - a0;
-      if (b > 0 && sweep <= 0) sweep += 2 * Math.PI;   // CCW — ensure positive
-      if (b < 0 && sweep >= 0) sweep -= 2 * Math.PI;   // CW  — ensure negative
-
-      // ~5° per segment
-      const nSeg = Math.max(2, Math.ceil(Math.abs(sweep) / (Math.PI / 36)));
-      for (let k = 1; k < nSeg; k++) {
-        const a = a0 + (k / nSeg) * sweep;
-        result.push([cx + R * Math.cos(a), cy + R * Math.sin(a)]);
-      }
-    }
-  }
-
-  // Push final vertex (it has no outgoing arc)
-  if (rawVerts.length > 0) {
-    const last = rawVerts[rawVerts.length - 1];
-    result.push([last[0], last[1]]);
-  }
-
-  return result;
-}
-
-// ============================================================
-// AXIS MAPPING — normalise DXF coords to [machineZ, radius]
-// Also takes abs(radius): profiles drawn on the left (negative X) work correctly.
-// ============================================================
-function applyAxisMapping(poly, mode) {
-  // mode: 'XZ_YR' → DXF X=machineZ, Y=R
-  //       'XR_YZ' → DXF X=R,        Y=machineZ
-  return poly.map(([a, b]) =>
+function applyAxisMapping(rawVerts, mode) {
+  return rawVerts.map(([a, b, bulge]) =>
     mode === 'XZ_YR'
-      ? [a, Math.abs(b)]
-      : [b, Math.abs(a)]
+      ? [a, Math.abs(b), bulge]
+      : [b, Math.abs(a), bulge]
   );
 }
 
 // ============================================================
-// GEOMETRY — left-side tool offset
+// BUILD SEGMENTS — convert [Z, R, bulge] vertices to segment objects
+//
+// Line:  { type:'line', z1,r1, z2,r2 }
+// Arc:   { type:'arc',  z1,r1, z2,r2, cz,cr, R, ccw }
+//          ccw: true → G3, false → G2
+//          Direction determined by cross-product in machine XZ space
+//          (correctly handles DXF→machine axis reflections).
 // ============================================================
+function buildSegments(verts) {
+  const segs = [];
+  for (let i = 0; i < verts.length - 1; i++) {
+    const [z1, r1, b] = verts[i];
+    const [z2, r2]    = verts[i + 1];
 
-// Returns unit left normal for a segment (p1→p2)
-function segLeftNormal(p1, p2) {
-  const dx = p2[0] - p1[0];
-  const dy = p2[1] - p1[1];
-  const len = Math.hypot(dx, dy);
-  if (len < 1e-12) return [0, 0];
-  return [-dy / len, dx / len]; // rotate tangent 90° CCW
+    if (Math.abs(b) < 1e-9) {
+      segs.push({ type: 'line', z1, r1, z2, r2 });
+      continue;
+    }
+
+    // Compute arc center in machine (Z, R) space from bulge
+    const chordLen = Math.hypot(z2 - z1, r2 - r1);
+    if (chordLen < 1e-12) continue;
+    const theta   = 4 * Math.atan(Math.abs(b));
+    const arcR    = chordLen / (2 * Math.sin(theta / 2));
+    const mz = (z1 + z2) / 2, mr = (r1 + r2) / 2;
+    // Left perpendicular of chord in machine (Z, R) space
+    const lnz = -(r2 - r1) / chordLen;
+    const lnr =  (z2 - z1) / chordLen;
+    const distMC = Math.sqrt(Math.max(0, arcR * arcR - (chordLen / 2) ** 2));
+    // sign(b): b>0 (DXF CCW) → center to the left in DXF space
+    // After abs(radius) reflection this may flip, but cross-product corrects direction.
+    const s  = Math.sign(b);
+    const cz = mz + s * lnz * distMC;
+    const cr = mr + s * lnr * distMC;
+
+    // Determine arc direction in machine XZ plane (X=R, Z=Z), viewed from +Y.
+    // Cross product Y component of (center→start) × (center→end):
+    //   v1=(r1-cr, z1-cz), v2=(r2-cr, z2-cz)
+    //   Y = v1.X * v2.Z - v1.Z * v2.X
+    //   Y > 0 → CCW → G3; Y < 0 → CW → G2
+    const v1x = r1 - cr, v1z = z1 - cz;
+    const v2x = r2 - cr, v2z = z2 - cz;
+    const cross = v1x * v2z - v1z * v2x;
+    segs.push({ type: 'arc', z1, r1, z2, r2, cz, cr, R: arcR, ccw: cross > 0 });
+  }
+  return segs;
 }
 
-function computeLeftOffset(pts, r) {
-  if (r === 0) return pts.map(p => [p[0], p[1]]);
-  const n = pts.length;
+// ============================================================
+// OFFSET SEGMENTS — left-side tool radius compensation
+//
+// Lines: translate endpoints by toolRadius along left normal.
+// Arcs:  same center, adjust radius:
+//   CCW (G3): left side = outside → R' = R + toolRadius
+//   CW  (G2): left side = inside  → R' = R - toolRadius
+//   Endpoint positions projected onto offset arc.
+//   Degenerate arcs (R' ≤ 0) are dropped.
+// ============================================================
+function offsetSegments(segs, toolRadius) {
+  if (toolRadius === 0) return segs.map(s => ({ ...s }));
+  const result = [];
+  for (const seg of segs) {
+    if (seg.type === 'line') {
+      const dz = seg.z2 - seg.z1, dr = seg.r2 - seg.r1;
+      const len = Math.hypot(dz, dr);
+      if (len < 1e-12) continue;
+      const nz = -dr / len, nr = dz / len; // left normal
+      result.push({
+        type: 'line',
+        z1: seg.z1 + toolRadius * nz, r1: seg.r1 + toolRadius * nr,
+        z2: seg.z2 + toolRadius * nz, r2: seg.r2 + toolRadius * nr,
+      });
+    } else {
+      const R2 = seg.ccw ? seg.R + toolRadius : seg.R - toolRadius;
+      if (R2 <= 0) continue; // arc collapses — skip
+      // Project start/end onto offset arc (same center, new radius)
+      const n1z = (seg.z1 - seg.cz) / seg.R, n1r = (seg.r1 - seg.cr) / seg.R;
+      const n2z = (seg.z2 - seg.cz) / seg.R, n2r = (seg.r2 - seg.cr) / seg.R;
+      result.push({
+        type: 'arc',
+        z1: seg.cz + R2 * n1z, r1: seg.cr + R2 * n1r,
+        z2: seg.cz + R2 * n2z, r2: seg.cr + R2 * n2r,
+        cz: seg.cz, cr: seg.cr, R: R2, ccw: seg.ccw,
+      });
+    }
+  }
+  return result;
+}
 
-  // Per-vertex averaged normal
-  const normals = pts.map((_, i) => {
-    if (i === 0)     return segLeftNormal(pts[0], pts[1]);
-    if (i === n - 1) return segLeftNormal(pts[n - 2], pts[n - 1]);
-    const na = segLeftNormal(pts[i - 1], pts[i]);
-    const nb = segLeftNormal(pts[i], pts[i + 1]);
-    const nx = na[0] + nb[0], ny = na[1] + nb[1];
-    const len = Math.hypot(nx, ny);
-    return len < 1e-12 ? na : [nx / len, ny / len];
+// Reverse a segment list for traversal in the opposite direction.
+function reverseSegments(segs) {
+  return [...segs].reverse().map(seg => {
+    if (seg.type === 'line') {
+      return { type: 'line', z1: seg.z2, r1: seg.r2, z2: seg.z1, r2: seg.r1 };
+    } else {
+      return {
+        type: 'arc',
+        z1: seg.z2, r1: seg.r2, z2: seg.z1, r2: seg.r1,
+        cz: seg.cz, cr: seg.cr, R: seg.R,
+        ccw: !seg.ccw, // reverse direction
+      };
+    }
   });
-
-  return pts.map((p, i) => [p[0] + r * normals[i][0], p[1] + r * normals[i][1]]);
 }
 
 // ============================================================
 // G-CODE GENERATOR
 // ============================================================
-function generateGCode(params, profile) {
+function generateGCode(params, segs) {
   const {
     feedrate, spindleSpeed, toolRadius, clearance,
     stockRadius, stepover, rotaryAxis, xMode,
     approachType, axialEntry
   } = params;
 
-  const A    = rotaryAxis;
-  const xFmt = xMode === 'diameter' ? r => (r * 2).toFixed(3) : r => r.toFixed(3);
+  const A     = rotaryAxis;
+  // X mode: endpoint coordinates only. I/K arc offsets always in radius.
+  const xFmt  = xMode === 'diameter' ? r => (r * 2).toFixed(3) : r => r.toFixed(3);
   const safeX = xMode === 'diameter'
     ? ((stockRadius + clearance) * 2).toFixed(3)
     : (stockRadius + clearance).toFixed(3);
 
-  const offset = computeLeftOffset(profile, toolRadius);
+  const offSegs = offsetSegments(segs, toolRadius);
+  if (!offSegs.length) return '; ERROR: no valid segments after offset';
 
-  const zs   = profile.map(p => p[0]);
-  const zMin = Math.min(...zs);
-  const zMax = Math.max(...zs);
+  const allZ  = segs.flatMap(s => [s.z1, s.z2]);
+  const zMin  = Math.min(...allZ);
+  const zMax  = Math.max(...allZ);
   const safeZ = (zMax + clearance).toFixed(3);
 
   const numPasses = Math.ceil(360 / stepover);
+  const enterFromZMin = axialEntry === 'zmin';
+  const entryZ = (enterFromZMin ? zMin - clearance : zMax + clearance).toFixed(3);
+  const exitZ  = (enterFromZMin ? zMax + clearance : zMin - clearance).toFixed(3);
 
-  // For axial approach: which end to enter from
-  const enterFromZMin = axialEntry === 'zmin'; // true → enter from low-Z side
-  const entryZ  = (enterFromZMin ? zMin - clearance : zMax + clearance).toFixed(3);
+  const arcCount  = segs.filter(s => s.type === 'arc').length;
 
-  const L = []; // lines
+  const L = [];
   const l = s => L.push(s);
 
   l('; =========================================');
@@ -585,59 +607,56 @@ function generateGCode(params, profile) {
   l(`; Tool radius    : ${toolRadius} mm`);
   l(`; Stock radius   : ${stockRadius} mm`);
   l(`; Stepover       : ${stepover}°  (${numPasses} passes)`);
-  l(`; Approach       : ${approachType === 'radial' ? 'Radial (side)' : `Axial (${enterFromZMin ? 'low-Z end' : 'high-Z end'})`}`);
+  l(`; Segments       : ${segs.length - arcCount} lines + ${arcCount} arcs`);
+  l(`; Approach       : ${approachType === 'radial' ? 'Radial (side)' : `Axial (${enterFromZMin ? 'low-Z' : 'high-Z'} entry)`}`);
   l(`; X mode         : ${xMode}`);
   l('; =========================================');
   l('');
   l('G21          ; metric');
   l('G90          ; absolute');
   l('G94          ; feed per minute');
+  l('G18          ; XZ plane (for G2/G3 arcs)');
   l(`S${spindleSpeed} M3    ; spindle on`);
   l(`G0 X${safeX} Z${safeZ} ${A}0.000  ; safe home`);
   l('');
 
+  // Helper: emit a segment as G-code (G1 / G2 / G3)
+  function emitSeg(seg) {
+    if (seg.type === 'line') {
+      l(`G1 Z${seg.z2.toFixed(3)} X${xFmt(seg.r2)} F${feedrate}`);
+    } else {
+      // I = center_R - start_R  (X offset, always radius)
+      // K = center_Z - start_Z
+      const I   = (seg.cr - seg.r1).toFixed(3);
+      const K   = (seg.cz - seg.z1).toFixed(3);
+      const cmd = seg.ccw ? 'G3' : 'G2';
+      l(`${cmd} Z${seg.z2.toFixed(3)} X${xFmt(seg.r2)} I${I} K${K} F${feedrate}`);
+    }
+  }
+
   for (let pass = 0; pass < numPasses; pass++) {
     const angle = (pass * stepover).toFixed(3);
-
     l(`; --- Pass ${String(pass + 1).padStart(3)} / ${numPasses}  |  ${A} = ${angle}° ---`);
     l(`G0 ${A}${angle}`);
 
+    const trav = (approachType === 'axial' && !enterFromZMin)
+      ? reverseSegments(offSegs)
+      : offSegs;
+
+    const first = trav[0];
+
     if (approachType === 'radial') {
-      // ---- RADIAL APPROACH ----
-      // 1. Rapid to first Z at safe radius
-      // 2. Feed radially in to first offset point
-      const [fz, fr] = offset[0];
-      l(`G0 Z${fz.toFixed(3)} X${safeX}`);
-      l(`G1 X${xFmt(fr)} F${feedrate}  ; radial plunge`);
-
-      // Follow profile
-      for (const [z, r] of offset) {
-        l(`G1 Z${z.toFixed(3)} X${xFmt(r)} F${feedrate}`);
-      }
+      l(`G0 Z${first.z1.toFixed(3)} X${safeX}`);
+      l(`G1 X${xFmt(first.r1)} F${feedrate}  ; radial plunge`);
+      for (const seg of trav) emitSeg(seg);
       l(`G0 X${safeX}  ; retract`);
-
     } else {
-      // ---- AXIAL APPROACH ----
-      // Determine profile direction to traverse
-      const trav = enterFromZMin ? offset : [...offset].reverse();
-      const [fz, fr] = trav[0];
-
-      // 1. Rapid to first profile radius at entry Z
-      l(`G0 X${xFmt(fr)} Z${entryZ}`);
-      // 2. Feed axially to first profile point
-      l(`G1 Z${fz.toFixed(3)} F${feedrate}  ; axial entry`);
-
-      // Follow profile
-      for (const [z, r] of trav) {
-        l(`G1 Z${z.toFixed(3)} X${xFmt(r)} F${feedrate}`);
-      }
-
-      // Retract axially then radially
-      const exitZ = (enterFromZMin ? zMax + clearance : zMin - clearance).toFixed(3);
+      l(`G0 X${xFmt(first.r1)} Z${entryZ}`);
+      l(`G1 Z${first.z1.toFixed(3)} F${feedrate}  ; axial entry`);
+      for (const seg of trav) emitSeg(seg);
       l(`G1 Z${exitZ} F${feedrate}  ; axial exit`);
       l(`G0 X${safeX}  ; retract`);
     }
-
     l('');
   }
 
@@ -650,7 +669,7 @@ function generateGCode(params, profile) {
 }
 
 // ============================================================
-// CANVAS PREVIEW
+// CANVAS PREVIEW — draws actual arc curves (not tessellated lines)
 // ============================================================
 function resizeCanvas(canvas) {
   const r = canvas.parentElement.getBoundingClientRect();
@@ -658,14 +677,14 @@ function resizeCanvas(canvas) {
   canvas.height = r.height;
 }
 
-function drawPreview(canvas, profile, offset, stockRadius) {
+function drawPreview(canvas, segs, offSegs, stockRadius) {
   const ctx = canvas.getContext('2d');
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = '#0d1117';
   ctx.fillRect(0, 0, W, H);
 
-  if (!profile || profile.length < 2) {
+  if (!segs || !segs.length) {
     ctx.fillStyle = '#374151';
     ctx.font = '12px sans-serif';
     ctx.textAlign = 'center';
@@ -674,45 +693,68 @@ function drawPreview(canvas, profile, offset, stockRadius) {
     return;
   }
 
-  const all = [...profile, ...offset];
-  const xs  = all.map(p => p[0]);
-  const ys  = all.map(p => p[1]);
-  const xlo = Math.min(...xs), xhi = Math.max(...xs);
-  const ylo = Math.min(Math.min(...ys), 0);
-  const yhi = Math.max(Math.max(...ys), stockRadius * 1.05);
+  // Compute bounds from all segment endpoints and arc centres
+  const pts = segs.flatMap(s =>
+    s.type === 'arc'
+      ? [[s.z1, s.r1], [s.z2, s.r2], [s.cz, s.cr]]
+      : [[s.z1, s.r1], [s.z2, s.r2]]
+  );
+  const offPts = offSegs.flatMap(s => [[s.z1, s.r1], [s.z2, s.r2]]);
+  const allPts = [...pts, ...offPts];
+  const zlo = Math.min(...allPts.map(p => p[0]));
+  const zhi = Math.max(...allPts.map(p => p[0]));
+  const rlo = Math.min(Math.min(...allPts.map(p => p[1])), 0);
+  const rhi = Math.max(Math.max(...allPts.map(p => p[1])), stockRadius * 1.05);
 
-  const pad   = 48;
-  const scaleX = (W - pad * 2) / (xhi - xlo || 1);
-  const scaleY = (H - pad * 2) / (yhi - ylo || 1);
+  const pad    = 48;
+  const scaleX = (W - pad * 2) / (zhi - zlo || 1);
+  const scaleY = (H - pad * 2) / (rhi - rlo || 1);
   const sc     = Math.min(scaleX, scaleY);
-  const ox     = pad + ((W - pad * 2) - (xhi - xlo) * sc) / 2;
-  const oy     = pad + ((H - pad * 2) - (yhi - ylo) * sc) / 2;
+  const ox     = pad + ((W - pad * 2) - (zhi - zlo) * sc) / 2;
+  const oy     = pad + ((H - pad * 2) - (rhi - rlo) * sc) / 2;
 
-  const tx = x => ox + (x - xlo) * sc;
-  const ty = y => H - oy - (y - ylo) * sc;
+  const tx = z => ox + (z - zlo) * sc;
+  const ty = r => H - oy - (r - rlo) * sc;
 
-  // Grid: axis lines
-  ctx.strokeStyle = '#1f2937';
-  ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(0, ty(0)); ctx.lineTo(W, ty(0)); ctx.stroke(); // R=0
-  ctx.beginPath(); ctx.moveTo(tx(xlo - 5), ty(0)); ctx.lineTo(tx(xhi + 5), ty(0)); ctx.stroke();
+  // Helper: draw a segment on the canvas
+  function drawSeg(seg, isFirst) {
+    if (isFirst) ctx.moveTo(tx(seg.z1), ty(seg.r1));
+    if (seg.type === 'line') {
+      ctx.lineTo(tx(seg.z2), ty(seg.r2));
+    } else {
+      // Canvas arc: angles in screen space (Y inverted relative to math space)
+      // startAngle in canvas space: atan2(-(r1-cr), z1-cz)
+      const sa = Math.atan2(-(seg.r1 - seg.cr), seg.z1 - seg.cz);
+      const ea = Math.atan2(-(seg.r2 - seg.cr), seg.z2 - seg.cz);
+      const R  = seg.R * sc;
+      // ccw in machine (G3) → CW in canvas (y-axis inverted) → anticlockwise=false
+      ctx.arc(tx(seg.cz), ty(seg.cr), R, sa, ea, !seg.ccw);
+    }
+  }
 
-  // Stock radius dashed line
+  // Stock radius
   ctx.strokeStyle = '#374151';
-  ctx.lineWidth = 1;
+  ctx.lineWidth   = 1;
   ctx.setLineDash([5, 5]);
   ctx.beginPath();
-  ctx.moveTo(tx(xlo - 3), ty(stockRadius));
-  ctx.lineTo(tx(xhi + 3), ty(stockRadius));
+  ctx.moveTo(tx(zlo - 3), ty(stockRadius));
+  ctx.lineTo(tx(zhi + 3), ty(stockRadius));
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Tool path (offset) — dashed amber
+  // Z axis baseline
+  ctx.strokeStyle = '#1f2937';
+  ctx.lineWidth   = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, ty(0)); ctx.lineTo(W, ty(0));
+  ctx.stroke();
+
+  // Offset (tool centre path) — dashed amber
   ctx.strokeStyle = '#fbbf24';
   ctx.lineWidth   = 1.5;
   ctx.setLineDash([4, 4]);
   ctx.beginPath();
-  offset.forEach(([z, r], i) => i === 0 ? ctx.moveTo(tx(z), ty(r)) : ctx.lineTo(tx(z), ty(r)));
+  offSegs.forEach((s, i) => drawSeg(s, i === 0));
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -720,32 +762,31 @@ function drawPreview(canvas, profile, offset, stockRadius) {
   ctx.strokeStyle = '#34d399';
   ctx.lineWidth   = 2;
   ctx.beginPath();
-  profile.forEach(([z, r], i) => i === 0 ? ctx.moveTo(tx(z), ty(r)) : ctx.lineTo(tx(z), ty(r)));
+  segs.forEach((s, i) => drawSeg(s, i === 0));
   ctx.stroke();
 
-  // Vertex dots
+  // Vertex dots at DXF vertices
   ctx.fillStyle = '#34d399';
-  profile.forEach(([z, r]) => {
-    ctx.beginPath();
-    ctx.arc(tx(z), ty(r), 2.5, 0, Math.PI * 2);
-    ctx.fill();
+  segs.forEach((s, i) => {
+    if (i === 0) { ctx.beginPath(); ctx.arc(tx(s.z1), ty(s.r1), 2.5, 0, Math.PI*2); ctx.fill(); }
+    ctx.beginPath(); ctx.arc(tx(s.z2), ty(s.r2), 2.5, 0, Math.PI*2); ctx.fill();
   });
 
   // Axis labels
-  ctx.fillStyle = '#4b5563';
-  ctx.font = '10px sans-serif';
-  ctx.textAlign = 'right';
+  ctx.fillStyle    = '#4b5563';
+  ctx.font         = '10px sans-serif';
+  ctx.textAlign    = 'right';
   ctx.textBaseline = 'middle';
-  ctx.fillText('R', tx(xlo) - 4, ty((yhi + ylo) / 2));
-  ctx.textAlign = 'center';
+  ctx.fillText('R', tx(zlo) - 4, ty((rhi + rlo) / 2));
+  ctx.textAlign    = 'center';
   ctx.textBaseline = 'top';
-  ctx.fillText('Z', tx((xhi + xlo) / 2), H - oy + 4);
+  ctx.fillText('Z', tx((zhi + zlo) / 2), H - oy + 4);
 }
 
 // ============================================================
 // STATE & EVENTS
 // ============================================================
-let state = { profile: null, offset: null };
+let state = { segs: null, offSegs: null, params: null };
 
 document.querySelectorAll('input[name="approach"]').forEach(r =>
   r.addEventListener('change', () => {
@@ -775,19 +816,11 @@ function generate() {
   errEl.classList.remove('show');
 
   const dxf = document.getElementById('dxfInput').value.trim();
-  if (!dxf) {
-    errEl.textContent = 'Paste DXF content first.';
-    errEl.classList.add('show');
-    return;
-  }
+  if (!dxf) { errEl.textContent = 'Paste DXF content first.'; errEl.classList.add('show'); return; }
 
   let polys;
   try { polys = parseDXF(dxf); }
-  catch (e) {
-    errEl.textContent = 'Parse error: ' + e.message;
-    errEl.classList.add('show');
-    return;
-  }
+  catch (e) { errEl.textContent = 'Parse error: ' + e.message; errEl.classList.add('show'); return; }
 
   if (!polys.length) {
     errEl.textContent = 'No LWPOLYLINE or POLYLINE found in DXF.';
@@ -795,27 +828,27 @@ function generate() {
     return;
   }
 
-  // Use longest polyline, then normalise axes + radius sign
-  const params  = getParams();
-  const rawPoly = polys.reduce((a, b) => b.length > a.length ? b : a);
-  const profile = applyAxisMapping(rawPoly, params.dxfAxisMap);
-  const offset  = computeLeftOffset(profile, params.toolRadius);
+  const params     = getParams();
+  const rawPoly    = polys.reduce((a, b) => b.length > a.length ? b : a);
+  const mappedVerts = applyAxisMapping(rawPoly, params.dxfAxisMap);
+  const segs       = buildSegments(mappedVerts);
+  const offSegs    = offsetSegments(segs, params.toolRadius);
 
-  state = { profile, offset, params };
+  state = { segs, offSegs, params };
 
-  const gcode = generateGCode(params, profile);
+  const gcode = generateGCode(params, segs);
   document.getElementById('gcodeOutput').value = gcode;
 
-  const lines = gcode.split('\n').length;
-  const passes = Math.ceil(360 / params.stepover);
-  const rawPts = polys.reduce((a, b) => b.length > a.length ? b : a).length;
+  const gcodeLines = gcode.split('\n').length;
+  const passes     = Math.ceil(360 / params.stepover);
+  const lineSegs   = segs.filter(s => s.type === 'line').length;
+  const arcSegs    = segs.filter(s => s.type === 'arc').length;
   document.getElementById('gcodeStats').textContent =
-    `${lines} lines · ${passes} passes · ${rawPts} DXF pts → ${profile.length} after tessellation`;
+    `${gcodeLines} lines · ${passes} passes · ${rawPoly.length} DXF pts → ${lineSegs}L + ${arcSegs}A segments`;
 
-  // Redraw canvas
   const canvas = document.getElementById('previewCanvas');
   resizeCanvas(canvas);
-  drawPreview(canvas, profile, offset, params.stockRadius);
+  drawPreview(canvas, segs, offSegs, params.stockRadius);
 }
 
 async function copyGCode() {
@@ -830,9 +863,8 @@ async function copyGCode() {
 }
 
 // ============================================================
-// SAMPLE DXF — simple vase-like pillar profile
+// SAMPLE DXF — vase profile with arc bulges (XR_YZ convention)
 // ============================================================
-// Sample uses DXF X=Radius, Y=Z (same convention as Pillar.dxf)
 const SAMPLE_DXF = `  0
 SECTION
   2
@@ -842,45 +874,39 @@ LWPOLYLINE
   8
 0
  90
-9
+6
  70
 0
  10
 -48.0
  20
 0.0
- 10
--44.0
- 20
-20.0
+ 42
+0.4
  10
 -36.0
  20
-40.0
+60.0
  10
 -32.0
  20
-60.0
- 10
--35.0
- 20
 80.0
+ 42
+-0.4
  10
--40.0
- 20
-100.0
- 10
--44.0
- 20
-120.0
- 10
--47.0
+-36.0
  20
 140.0
+ 42
+0.4
  10
 -48.0
  20
-160.0
+180.0
+ 10
+-48.0
+ 20
+200.0
   0
 ENDSEC
   0
@@ -902,8 +928,8 @@ window.addEventListener('load', () => {
 window.addEventListener('resize', () => {
   const canvas = document.getElementById('previewCanvas');
   resizeCanvas(canvas);
-  if (state.profile) {
-    drawPreview(canvas, state.profile, state.offset, state.params.stockRadius);
+  if (state.segs) {
+    drawPreview(canvas, state.segs, state.offSegs, state.params.stockRadius);
   } else {
     drawPreview(canvas, null, null, parseFloat(document.getElementById('stockRadius').value) || 50);
   }

@@ -2,7 +2,7 @@
 
 Generates G-code for **cylindrical pillar turning / carving** on a 3-axis CNC with a 4th rotary axis. The tool follows a 2D profile while the rotary axis indexes through 360°.
 
-_Last updated: 2026-06-16 rev 2_
+_Last updated: 2026-06-16 rev 3_
 
 ---
 
@@ -90,19 +90,35 @@ When entering from the high-Z end, the profile is traversed in reverse (last poi
 
 ```gcode
 ; header / parameters comment block
-G21 G90 G94
+G21          ; metric
+G90          ; absolute
+G94          ; feed per minute
+G18          ; XZ plane — required for G2/G3 arc moves
 S{spindleSpeed} M3
 G0 X{safe_X} Z{safe_Z} A0.000
 
 ; for each pass (angle = 0, stepover, 2×stepover, …):
+;   G0 A{angle}
 ;   approach move
-;   G1 profile points
+;   G1 / G2 / G3 profile segments
 ;   retract
 
 M5
 G0 X{safe_X} Z{safe_Z}
 M30
 ```
+
+### Arc move format (G18 XZ plane)
+
+```gcode
+G2 Z{end_Z} X{end_R} I{center_R - start_R} K{center_Z - start_Z} F{feedrate}
+G3 Z{end_Z} X{end_R} I{center_R - start_R} K{center_Z - start_Z} F{feedrate}
+```
+
+- `G2` = CW arc (viewed from +Y); `G3` = CCW arc.
+- `I` = X-axis offset from start to arc centre (always in radius units, even in diameter mode).
+- `K` = Z-axis offset from start to arc centre.
+- Direction determined from the cross-product of (centre→start) × (centre→end) in machine XZ space, so reflections from the abs(radius) mapping are handled automatically.
 
 ---
 
@@ -116,16 +132,22 @@ If multiple polylines exist, the longest one is used.
 
 Closed polylines (flag bit 0 set) have their first point appended as the last point.
 
-### Arc Bulge Tessellation
+### Arc Bulge Conversion
 
 A DXF bulge value `b` on vertex `i` defines an arc from `vertex[i]` to `vertex[i+1]`:
 - `b = tan(θ/4)` where `θ` is the subtended angle.
-- `b > 0` → CCW arc; `b < 0` → CW arc; `b = 0` → straight line.
+- `b > 0` → CCW in DXF space; `b < 0` → CW; `b = 0` → straight line (segment omitted).
 - Arc radius: `R = chord / (2·sin(θ/2))`
-- The arc is tessellated into linear segments at ~5° resolution (≤ 5° angular error per segment).
-- The stats bar shows original DXF vertex count vs tessellated point count.
 
-The `Pillar.dxf` reference file contains 10 DXF vertices with bulges, which tessellate to ~50+ points.
+Each arc segment is output as a single **G2/G3** move — no tessellation. The arc direction (G2 vs G3) is computed from the cross-product of the arc centre vectors in machine XZ space, which correctly handles the axis-mapping reflection (abs of radius reverses DXF CCW/CW).
+
+**Tool radius offset on arcs:** the arc centre is unchanged; only the radius is adjusted:
+- G3 (CCW) arc: `R_offset = R + toolRadius` (tool on outside)
+- G2 (CW) arc: `R_offset = R − toolRadius` (tool on inside)
+
+If `R_offset ≤ 0` the arc is degenerate and is dropped.
+
+The stats bar shows: `N DXF pts → L lines + A arcs`.
 
 ---
 
@@ -144,7 +166,8 @@ Axes: Z horizontal, R vertical. Canvas auto-resizes with the window.
 
 ## Known Limitations
 
-- All profile moves are G1 linear segments. DXF arc bulges are tessellated to ~5° resolution before G-code output — no G2/G3 in output.
+- Non-tangent transitions between line and arc segments produce small position discontinuities at junctions. CAD profiles designed with tangent continuity (as `Pillar.dxf` is) are not affected.
+- G2/G3 arcs require the machine controller to support **G18** (XZ plane). Most FANUC-compatible and Haas controllers do; verify before running.
 - No roughing passes — a single finish pass per angle. Run multiple times with increasing depth, or offset the stock radius inward manually to simulate roughing.
 - Assumes a symmetric cylindrical stock (constant radius along Z).
 - No collision detection — if the offset profile radius exceeds the stock radius at any point, the generated G-code will air-cut or gouge, depending on direction.
