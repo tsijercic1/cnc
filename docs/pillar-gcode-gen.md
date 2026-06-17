@@ -2,7 +2,7 @@
 
 Generates G-code for **cylindrical pillar turning / carving** on a 3-axis CNC with a 4th rotary axis. The tool follows a 2D profile while the rotary axis indexes through 360°.
 
-_Last updated: 2026-06-16 rev 4_
+_Last updated: 2026-06-16 rev 5_
 
 ---
 
@@ -32,10 +32,15 @@ The default matches the `Pillar.dxf` reference file (AutoCAD R12 / AC1009 format
 | Tool radius | `toolRadius` | mm | Radius of the cutting tool. Used for left-side offset. |
 | Clearance | `clearance` | mm | Safety distance added to stock radius for rapids; also used for approach/exit overtravel. |
 | Stock radius | `stockRadius` | mm | Radius of the raw stock cylinder. Used to compute safe retract X and preview stock line. |
-| Stepover | `stepover` | ° | Angular increment between passes. Total passes = ⌈360 / stepover⌉. |
+| ~~Stepover~~ | ~~`stepover`~~ | — | ~~See Rotation mode above.~~ |
 | 4th axis letter | `rotaryAxis` | — | Letter used in G-code for the rotary axis: A, B, or C. |
 | X mode | `xMode` | — | `radius` → X values are radii. `diameter` → X values are doubled (lathe diameter convention). |
-| Approach direction | `approach` (radio) | — | `radial` (side) or `axial` (end). |
+| Rotation mode | `rotMode` (radio) | — | `indexed` (stepover, default) or `continuous`. |
+| Stepover | `stepover` | ° | Angular increment between indexed passes. Total passes = ⌈360/stepover⌉. Hidden in continuous mode. |
+| Engagement start | `engagementStart` | mm | Continuous mode only. Radial depth above the finish profile at the very start of rotation. |
+| Feed / rev | `feedPerRev` | mm | Continuous mode only. Radial material removed per full 360° revolution. |
+| Include finishing (cont.) | `contIncludeFinishing` | — | Continuous mode only. After all roughing revolutions, do one final full revolution at the finish profile. |
+| Approach direction | `approach` (radio) | — | `radial` (side) or `axial` (end). Continuous mode always uses radial approach. |
 | Axial entry from | `axialEntry` | — | Only active when approach = axial. `zmin` = enter from low-Z end; `zmax` = enter from high-Z end. |
 | Enable roughing | `roughingEnabled` | — | When checked, emits multiple radial passes per angle before the finish pass. |
 | Pass depth | `passDepth` | mm | Radial depth of each roughing pass. |
@@ -87,6 +92,46 @@ G0 X{safe_X}                        ; retract
 `entry_Z` = `Z_start − clearance` (low-Z entry) or `Z_end + clearance` (high-Z entry).
 
 When entering from the high-Z end, the profile is traversed in reverse (last point → first point).
+
+---
+
+## Rotation Modes
+
+### Indexed (default)
+
+A axis indexes to fixed angles (`0, stepover, 2×stepover, …`). At each angle the tool makes a full Z traverse (plus any roughing passes, see below), then retracts and rotates to the next angle. This is the traditional approach — the machine is stationary rotationally during each cut.
+
+### Continuous
+
+A rotates continuously while Z traverses the profile. The two parameters drive a **spiral-in** cut:
+
+| Parameter | Meaning |
+|-----------|---------|
+| `engagementStart` | Radial depth above the finish profile at first contact (total roughing depth). |
+| `feedPerRev` | Material removed per 360° of A rotation. |
+
+**Algorithm:**
+
+1. `nRoughRevs = ⌈engagementStart / feedPerRev⌉` — number of full A revolutions to reach the finish profile.
+2. `angularStep = 2·arcsin(toolRadius / minR) × 0.9` — step between Z traverses, ensures 10% overlap at the tightest profile point.
+3. `nPassesPerRev = ⌈360 / angularStep⌉` — Z traverses per revolution (always a whole number so each revolution lands on a full 360° boundary).
+4. The tool makes `nRoughRevs × nPassesPerRev` Z traverses (boustrophedon — alternating forward/reverse). Depth decreases **continuously** within each traverse: `depth(t) = depthStart + t × (depthEnd − depthStart)`, creating a smooth helical spiral.
+5. Optionally one finishing revolution at depth = 0.
+
+**G-code structure:**
+
+```gcode
+G0 Z{zStart} X{safeX}          ; position axially
+G1 X{profile + engagementStart} ; radial plunge
+; --- For each Z traverse ---
+G1 Z{z} X{profile(z) + depth(t)} A{a} F{feedrate}
+; (no retracts between traverses — continuous motion)
+M5
+G0 X{safeX}
+M30
+```
+
+Because arcs cannot be used for this coupled Z-X-A motion, the profile is tessellated into fine (≈0.5 mm) G1 segments.
 
 ---
 

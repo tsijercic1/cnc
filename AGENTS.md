@@ -61,6 +61,17 @@ All G-code is metric (G21), absolute (G90), feed per minute (G94).
 - Always include a canvas preview showing: finished profile (green solid), tool centre path (amber dashed), stock radius line (grey dashed).
 - Include a "Load sample" shortcut so the tool can be tested without a real DXF.
 
+### Rotation modes (pillar-gcode-gen)
+- **Indexed** (default): A indexes to fixed angles; full Z traverse at each angle. Controlled by `stepover` (°).
+- **Continuous**: A rotates without stopping; Z traverses boustrophedon while depth spirals inward.
+  - `engagementStart` (mm): total radial depth above finish profile at start.
+  - `feedPerRev` (mm): radial depth removed per 360° of A.
+  - `angularStep = min(5°, 2·arcsin(toolR/minR)·0.9)` — ensures 10% tool overlap at tightest point.
+  - `nPassesPerRev = ceil(360/angularStep)` — Z traverses per revolution; exact so each rev ends on 360° boundary.
+  - Depth interpolated continuously within each Z traverse (not stepped): smooth helical spiral.
+  - Profile tessellated to ~0.5 mm G1 lines (arcs cannot be used with simultaneous A motion).
+  - No mid-path retracts; one radial approach at start, one retract at end.
+
 ### Roughing operation (pillar-gcode-gen)
 - Enabled by `roughingEnabled` checkbox; controlled by `passDepth` and `finishAllowance`.
 - Pass count `N = max(0, ceil((stockRadius − minProfileR − finishAllowance) / passDepth))`.

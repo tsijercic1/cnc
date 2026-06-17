@@ -298,16 +298,54 @@ select option { background: #1f2937; }
     <!-- Rotary params -->
     <div class="section">
       <div class="section-title">Rotary Parameters</div>
-      <div class="row2">
-        <div class="field">
-          <label>Stock radius (mm)</label>
-          <input type="number" id="stockRadius" value="50" min="1" step="0.5">
+      <div class="field">
+        <label>Stock radius (mm)</label>
+        <input type="number" id="stockRadius" value="50" min="1" step="0.5">
+      </div>
+
+      <!-- Rotation mode toggle -->
+      <div class="field">
+        <label>Rotation mode</label>
+        <div class="radio-group">
+          <label class="radio-option">
+            <input type="radio" name="rotMode" value="indexed" checked>
+            <span>Indexed</span>
+          </label>
+          <label class="radio-option">
+            <input type="radio" name="rotMode" value="continuous">
+            <span>Continuous</span>
+          </label>
         </div>
+      </div>
+
+      <!-- Indexed: stepover only -->
+      <div id="indexedFields">
         <div class="field">
           <label>Stepover (°)</label>
           <input type="number" id="stepover" value="5" min="0.1" step="0.5" max="360">
         </div>
       </div>
+
+      <!-- Continuous: engagement parameters -->
+      <div id="continuousFields" style="display:none">
+        <div class="row2">
+          <div class="field">
+            <label title="Radial depth of first contact above finish profile">Engagement start (mm)</label>
+            <input type="number" id="engagementStart" value="0.5" min="0.01" step="0.05">
+          </div>
+          <div class="field">
+            <label title="Radial depth removed per full 360° rotation">Feed / rev (mm)</label>
+            <input type="number" id="feedPerRev" value="0.2" min="0.01" step="0.05">
+          </div>
+        </div>
+        <div class="field">
+          <label class="radio-option">
+            <input type="checkbox" id="contIncludeFinishing" checked>
+            <span>Include finishing pass</span>
+          </label>
+        </div>
+      </div>
+
       <div class="row2">
         <div class="field">
           <label>4th axis letter</label>
@@ -548,17 +586,114 @@ function buildSegments(verts) {
 //   CW  (G2): left side = inside  → R' = R - toolRadius
 //   Endpoint positions projected onto offset arc.
 //   Degenerate arcs (R' ≤ 0) are dropped.
+// After computing raw offsets, fixOffsetJunctions() trims overlapping
+// adjacent pairs to their exact geometric intersection, removing loops.
 // ============================================================
+
+// --- Geometric helpers (used only by fixOffsetJunctions) ---
+
+function _llIntersect(z1, r1, z2, r2, z3, r3, z4, r4) {
+  // Infinite-line intersection; returns {z, r} or null
+  const dz1 = z2-z1, dr1 = r2-r1, dz2 = z4-z3, dr2 = r4-r3;
+  const det = dz1*dr2 - dr1*dz2;
+  if (Math.abs(det) < 1e-12) return null;
+  const t = ((z3-z1)*dr2 - (r3-r1)*dz2) / det;
+  return { z: z1 + t*dz1, r: r1 + t*dr1 };
+}
+
+function _lcIntersect(z1, r1, z2, r2, cz, cr, R) {
+  // Line segment direction vs circle; returns array of {z, r}
+  const dz = z2-z1, dr = r2-r1;
+  const fz = z1-cz, fr = r1-cr;
+  const a = dz*dz + dr*dr;
+  if (a < 1e-24) return [];
+  const b = 2*(dz*fz + dr*fr);
+  const c = fz*fz + fr*fr - R*R;
+  const disc = b*b - 4*a*c;
+  if (disc < 0) return [];
+  const sq = Math.sqrt(Math.max(0, disc));
+  return [(-b-sq)/(2*a), (-b+sq)/(2*a)].map(t => ({ z: z1+t*dz, r: r1+t*dr }));
+}
+
+function _ccIntersect(cz1, cr1, R1, cz2, cr2, R2) {
+  // Circle-circle intersection; returns array of {z, r}
+  const d = Math.hypot(cz2-cz1, cr2-cr1);
+  if (d > R1+R2+1e-9 || d < Math.abs(R1-R2)-1e-9 || d < 1e-12) return [];
+  const a = (R1*R1 - R2*R2 + d*d) / (2*d);
+  const h2 = R1*R1 - a*a;
+  if (h2 < 0) return [];
+  const h  = Math.sqrt(Math.max(0, h2));
+  const mz = cz1 + a*(cz2-cz1)/d, mr = cr1 + a*(cr2-cr1)/d;
+  if (h < 1e-9) return [{ z: mz, r: mr }];
+  const px = h*(cr2-cr1)/d, py = h*(cz2-cz1)/d;
+  return [{ z: mz+px, r: mr-py }, { z: mz-px, r: mr+py }];
+}
+
+function _nearest(pts, z, r) {
+  return pts.reduce((best, p) =>
+    Math.hypot(p.z-z, p.r-r) < Math.hypot(best.z-z, best.r-r) ? p : best);
+}
+
+// Snap a point onto a segment's underlying geometry (arc circle or line — line is already on it)
+function _snapToSeg(seg, iz, ir) {
+  if (seg.type !== 'arc') return { z: iz, r: ir };
+  const d = Math.hypot(iz-seg.cz, ir-seg.cr);
+  if (d < 1e-9) return { z: iz, r: ir };
+  return { z: seg.cz + seg.R*(iz-seg.cz)/d, r: seg.cr + seg.R*(ir-seg.cr)/d };
+}
+
+// Fix junctions between consecutive offset segments by trimming both to their intersection.
+// Handles line-line, line-arc, arc-line, arc-arc cases.
+function fixOffsetJunctions(segs) {
+  if (segs.length < 2) return segs;
+  const out = segs.map(s => ({...s}));
+
+  for (let i = 0; i < out.length - 1; i++) {
+    const A = out[i], B = out[i+1];
+    const gapD = Math.hypot(A.z2 - B.z1, A.r2 - B.r1);
+    if (gapD < 1e-6) continue; // already touching
+
+    // Midpoint as "expected junction"
+    const jz = (A.z2 + B.z1) / 2, jr = (A.r2 + B.r1) / 2;
+
+    // Collect intersection candidates between the underlying infinite curves
+    let cands = [];
+    if      (A.type === 'line' && B.type === 'line') { const p = _llIntersect(A.z1,A.r1,A.z2,A.r2, B.z1,B.r1,B.z2,B.r2); if (p) cands = [p]; }
+    else if (A.type === 'line' && B.type === 'arc' ) { cands = _lcIntersect(A.z1,A.r1,A.z2,A.r2, B.cz,B.cr,B.R); }
+    else if (A.type === 'arc'  && B.type === 'line') { cands = _lcIntersect(B.z1,B.r1,B.z2,B.r2, A.cz,A.cr,A.R); }
+    else                                              { cands = _ccIntersect(A.cz,A.cr,A.R, B.cz,B.cr,B.R); }
+
+    if (!cands.length) continue;
+    const pt = cands.length === 1 ? cands[0] : _nearest(cands, jz, jr);
+
+    // Reject if the junction fix is unreasonably far (> 2× longest segment + gap)
+    const maxLen = 2 * Math.max(
+      Math.hypot(A.z2-A.z1, A.r2-A.r1),
+      Math.hypot(B.z2-B.z1, B.r2-B.r1)) + gapD;
+    if (Math.hypot(pt.z-jz, pt.r-jr) > maxLen) continue;
+
+    // Snap to arc circle to keep G2/G3 math exact
+    const pa = _snapToSeg(A, pt.z, pt.r);
+    const pb = _snapToSeg(B, pt.z, pt.r);
+    // Use the A-snapped point for A's end; B-snapped for B's start
+    A.z2 = pa.z; A.r2 = pa.r;
+    B.z1 = pb.z; B.r1 = pb.r;
+  }
+
+  // Drop degenerate segments that collapsed to zero length after trimming
+  return out.filter(s => Math.hypot(s.z2-s.z1, s.r2-s.r1) > 1e-6);
+}
+
 function offsetSegments(segs, toolRadius) {
   if (toolRadius === 0) return segs.map(s => ({ ...s }));
-  const result = [];
+  const raw = [];
   for (const seg of segs) {
     if (seg.type === 'line') {
       const dz = seg.z2 - seg.z1, dr = seg.r2 - seg.r1;
       const len = Math.hypot(dz, dr);
       if (len < 1e-12) continue;
       const nz = -dr / len, nr = dz / len; // left normal
-      result.push({
+      raw.push({
         type: 'line',
         z1: seg.z1 + toolRadius * nz, r1: seg.r1 + toolRadius * nr,
         z2: seg.z2 + toolRadius * nz, r2: seg.r2 + toolRadius * nr,
@@ -566,10 +701,9 @@ function offsetSegments(segs, toolRadius) {
     } else {
       const R2 = seg.ccw ? seg.R + toolRadius : seg.R - toolRadius;
       if (R2 <= 0) continue; // arc collapses — skip
-      // Project start/end onto offset arc (same center, new radius)
       const n1z = (seg.z1 - seg.cz) / seg.R, n1r = (seg.r1 - seg.cr) / seg.R;
       const n2z = (seg.z2 - seg.cz) / seg.R, n2r = (seg.r2 - seg.cr) / seg.R;
-      result.push({
+      raw.push({
         type: 'arc',
         z1: seg.cz + R2 * n1z, r1: seg.cr + R2 * n1r,
         z2: seg.cz + R2 * n2z, r2: seg.cr + R2 * n2r,
@@ -577,7 +711,7 @@ function offsetSegments(segs, toolRadius) {
       });
     }
   }
-  return result;
+  return fixOffsetJunctions(raw);
 }
 
 // Reverse a segment list for traversal in the opposite direction.
@@ -597,9 +731,165 @@ function reverseSegments(segs) {
 }
 
 // ============================================================
+// PROFILE TESSELLATION (used by continuous mode)
+// ============================================================
+// Returns array of [z, r] from an already-offset segment list, sampled at ≤ stepMm resolution.
+function tessellateSegments(segs, stepMm) {
+  const pts = [];
+  for (const seg of segs) {
+    if (seg.type === 'line') {
+      const d = Math.hypot(seg.z2 - seg.z1, seg.r2 - seg.r1);
+      const n = Math.max(1, Math.ceil(d / stepMm));
+      for (let i = 0; i <= n; i++) {
+        pts.push([seg.z1 + (i/n)*(seg.z2-seg.z1), seg.r1 + (i/n)*(seg.r2-seg.r1)]);
+      }
+    } else {
+      // Arc in Z-R plane: centre (cz, cr), radius R, from (z1,r1) to (z2,r2)
+      const sa = Math.atan2(seg.r1 - seg.cr, seg.z1 - seg.cz);
+      let ea   = Math.atan2(seg.r2 - seg.cr, seg.z2 - seg.cz);
+      let delta = ea - sa;
+      if ( seg.ccw && delta < 0) delta += 2 * Math.PI;
+      if (!seg.ccw && delta > 0) delta -= 2 * Math.PI;
+      const arcLen = Math.abs(seg.R * delta);
+      const n = Math.max(4, Math.ceil(arcLen / stepMm));
+      for (let i = 0; i <= n; i++) {
+        const theta = sa + (i/n) * delta;
+        pts.push([seg.cz + seg.R * Math.cos(theta), seg.cr + seg.R * Math.sin(theta)]);
+      }
+    }
+  }
+  // Deduplicate consecutive coincident points
+  return pts.filter((p, i) =>
+    i === 0 || Math.hypot(p[0]-pts[i-1][0], p[1]-pts[i-1][1]) > 1e-6);
+}
+
+// ============================================================
+// CONTINUOUS-MODE G-CODE GENERATOR
+// ============================================================
+// Strategy: boustrophedon Z traversal (forward/reverse alternating) while A rotates
+// continuously. Angular step = 2·arcsin(toolR / minR) guarantees no surface gaps.
+// Depth spirals from engagementStart → 0 over nRoughRevs full A revolutions.
+function generateContinuousGCode(params, segs) {
+  const {
+    feedrate, spindleSpeed, toolRadius, clearance, stockRadius,
+    rotaryAxis, xMode,
+    engagementStart, feedPerRev, contIncludeFinishing,
+  } = params;
+
+  const A    = rotaryAxis;
+  const xFmt = xMode === 'diameter' ? r => (r*2).toFixed(3) : r => r.toFixed(3);
+  const safeX = xMode === 'diameter'
+    ? ((stockRadius + clearance)*2).toFixed(3)
+    : (stockRadius + clearance).toFixed(3);
+
+  // Build tessellated finish-offset profile (tool centre at finish depth)
+  const finOffSegs = offsetSegments(segs, toolRadius);
+  if (!finOffSegs.length) return '; ERROR: no valid segments after offset';
+  const finPts = tessellateSegments(finOffSegs, 0.5);
+  if (!finPts.length) return '; ERROR: empty tessellation';
+
+  const zMin = Math.min(...finPts.map(p => p[0]));
+  const zMax = Math.max(...finPts.map(p => p[0]));
+  const minR  = Math.min(...finPts.map(p => p[1]));
+  const safeZ = (zMax + clearance).toFixed(3);
+
+  // Angular step: 2·arcsin(toolR/minR) degrees covers exactly one tool-diameter strip.
+  // Use 90% for slight overlap → no gaps on the tightest part of the profile.
+  const coverageDeg = (toolRadius > 0 && minR > toolRadius)
+    ? (2 * Math.asin(Math.min(1, toolRadius / minR))) * (180 / Math.PI)
+    : 5;
+  const angularStep   = Math.min(5, coverageDeg * 0.9);
+  const nPassesPerRev = Math.ceil(360 / angularStep);
+  const exactStep     = 360 / nPassesPerRev;   // ensures we land exactly on multiples of 360°
+
+  // Roughing: start at engagementStart above finish, reduce by feedPerRev per revolution
+  const nRoughRevs    = engagementStart > 0 ? Math.max(1, Math.ceil(engagementStart / feedPerRev)) : 0;
+  const nFinishRevs   = contIncludeFinishing ? 1 : 0;
+  const totalPasses   = (nRoughRevs + nFinishRevs) * nPassesPerRev;
+  // Depth decrease per single Z-traverse pass (linear across all roughing passes)
+  const depthDecPerPass = nRoughRevs > 0 ? engagementStart / (nRoughRevs * nPassesPerRev) : 0;
+
+  const arcCount = segs.filter(s => s.type === 'arc').length;
+
+  const L = [];
+  const l = s => L.push(s);
+
+  l('; =========================================');
+  l('; Cylindrical Pillar G-code — Continuous Mode');
+  l(`; Tool radius     : ${toolRadius} mm`);
+  l(`; Stock radius    : ${stockRadius} mm`);
+  l(`; Engagement start: ${engagementStart} mm`);
+  l(`; Feed / rev      : ${feedPerRev} mm`);
+  l(`; Angular step    : ${exactStep.toFixed(3)}°  (${nPassesPerRev} passes/rev, coverage ${coverageDeg.toFixed(2)}°)`);
+  l(`; Roughing revs   : ${nRoughRevs}  |  Finish : ${contIncludeFinishing}`);
+  l(`; Total Z passes  : ${totalPasses}`);
+  l(`; Profile pts     : ${finPts.length} (tessellated from ${segs.length - arcCount}L + ${arcCount}A)`);
+  l('; =========================================');
+  l('');
+  l('G21          ; metric');
+  l('G90          ; absolute');
+  l('G94          ; feed per minute');
+  l('G18          ; XZ plane');
+  l(`S${spindleSpeed} M3    ; spindle on`);
+  l(`G0 X${safeX} Z${safeZ} ${A}0.000  ; safe home`);
+  l('');
+
+  // Radial approach to first point at full engagement depth
+  const firstPt = finPts[0];
+  l(`G0 Z${firstPt[0].toFixed(3)} X${safeX}  ; position to profile start`);
+  l(`G1 X${xFmt(firstPt[1] + engagementStart)} F${feedrate}  ; radial plunge to engagement`);
+  l('');
+
+  let currentA = 0;
+  let dir      = 1;  // +1 = forward (pts[0]→pts[N]), -1 = reverse
+
+  for (let passIdx = 0; passIdx < totalPasses; passIdx++) {
+    const isFinish = passIdx >= nRoughRevs * nPassesPerRev;
+    const aStart   = currentA;
+    const aEnd     = currentA + exactStep;
+
+    // Depth offset at the start and end of this Z traverse (depth changes linearly across the pass)
+    const depthStart = isFinish ? 0 : Math.max(0, engagementStart - passIdx       * depthDecPerPass);
+    const depthEnd   = isFinish ? 0 : Math.max(0, engagementStart - (passIdx + 1) * depthDecPerPass);
+
+    // Label at each revolution boundary
+    if (passIdx % nPassesPerRev === 0) {
+      const revLabel = isFinish ? 'Finish revolution' :
+        `Rough rev ${Math.floor(passIdx / nPassesPerRev) + 1}/${nRoughRevs}`;
+      l(`; === ${revLabel}  A ${aStart.toFixed(1)}°  depth ${depthStart.toFixed(3)}→${Math.max(0, engagementStart - Math.min(nRoughRevs * nPassesPerRev, passIdx + nPassesPerRev) * depthDecPerPass).toFixed(3)} ===`);
+    }
+
+    const pts = dir === 1 ? finPts : [...finPts].reverse();
+
+    pts.forEach((pt, i) => {
+      if (passIdx === 0 && i === 0) return;  // already positioned there by the approach move
+      const t     = i / Math.max(1, pts.length - 1);
+      const a     = aStart + t * exactStep;
+      // Depth interpolates continuously across the Z traverse: smooth spiral in X
+      const depth = depthStart + t * (depthEnd - depthStart);
+      l(`G1 Z${pt[0].toFixed(3)} X${xFmt(pt[1] + depth)} ${A}${a.toFixed(3)} F${feedrate}`);
+    });
+
+    currentA = aEnd;
+    dir = -dir;
+  }
+
+  l('');
+  l('; =========================================');
+  l('M5           ; spindle off');
+  l(`G0 X${safeX} Z${safeZ}`);
+  l('M30');
+
+  return L.join('\n');
+}
+
+// ============================================================
 // G-CODE GENERATOR
 // ============================================================
 function generateGCode(params, segs) {
+  // Dispatch to continuous mode if selected
+  if (params.continuousMode) return generateContinuousGCode(params, segs);
+
   const {
     feedrate, spindleSpeed, toolRadius, clearance,
     stockRadius, stepover, rotaryAxis, xMode,
@@ -849,12 +1139,18 @@ function drawPreview(canvas, segs, offSegs, stockRadius, roughingSegArrays) {
     ctx.beginPath(); ctx.arc(tx(s.z2), ty(s.r2), 2.5, 0, Math.PI*2); ctx.fill();
   });
 
-  // Legend (only when roughing passes are shown)
+  // Legend (only when depth-band passes are shown)
+  const isContinuousPreview = N > 0 && roughArrays.length > 0 &&
+    // heuristic: continuous bands are evenly spaced from engagementStart; roughing passes vary
+    true; // always show the same legend structure
   if (N > 0) {
+    const depthLabel = isContinuousPreview
+      ? `Depth bands (${N})`
+      : `Roughing (${N} pass${N !== 1 ? 'es' : ''})`;
     const items = [
-      { color: '#34d399',           dash: false, label: 'Profile' },
-      { color: 'rgba(245,158,11,0.7)', dash: true,  label: `Roughing (${N} pass${N !== 1 ? 'es' : ''})` },
-      { color: '#fbbf24',           dash: true,  label: 'Finish path' },
+      { color: '#34d399',              dash: false, label: 'Profile' },
+      { color: 'rgba(245,158,11,0.7)', dash: true,  label: depthLabel },
+      { color: '#fbbf24',              dash: true,  label: 'Finish path' },
     ];
     ctx.font = '10px sans-serif';
     ctx.textBaseline = 'middle';
@@ -902,7 +1198,16 @@ document.getElementById('roughingEnabled').addEventListener('change', function (
   document.getElementById('roughingParams').style.display = this.checked ? 'block' : 'none';
 });
 
+document.querySelectorAll('input[name="rotMode"]').forEach(r =>
+  r.addEventListener('change', () => {
+    const cont = document.querySelector('input[name="rotMode"]:checked').value === 'continuous';
+    document.getElementById('indexedFields').style.display    = cont ? 'none'  : 'block';
+    document.getElementById('continuousFields').style.display = cont ? 'block' : 'none';
+  })
+);
+
 function getParams() {
+  const continuousMode = document.querySelector('input[name="rotMode"]:checked').value === 'continuous';
   return {
     feedrate:     parseFloat(document.getElementById('feedrate').value)     || 800,
     spindleSpeed: parseInt(document.getElementById('spindleSpeed').value)    || 12000,
@@ -915,10 +1220,16 @@ function getParams() {
     approachType:      document.querySelector('input[name="approach"]:checked').value,
     axialEntry:        document.getElementById('axialEntry').value,
     dxfAxisMap:        document.getElementById('dxfAxisMap').value,
+    // Indexed roughing
     roughingEnabled:   document.getElementById('roughingEnabled').checked,
     passDepth:         parseFloat(document.getElementById('passDepth').value)       || 2,
     finishAllowance:   parseFloat(document.getElementById('finishAllowance').value) || 0.5,
     includeFinishing:  document.getElementById('includeFinishing').checked,
+    // Continuous mode
+    continuousMode,
+    engagementStart:     parseFloat(document.getElementById('engagementStart').value)     || 0.5,
+    feedPerRev:          parseFloat(document.getElementById('feedPerRev').value)          || 0.2,
+    contIncludeFinishing: document.getElementById('contIncludeFinishing').checked,
   };
 }
 
@@ -945,16 +1256,22 @@ function generate() {
   const segs       = buildSegments(mappedVerts);
   const offSegs    = offsetSegments(segs, params.toolRadius);
 
-  // Build roughing pass segment arrays for preview
+  // Build preview segment arrays for depth visualisation
   let roughingSegArrays = [];
-  if (params.roughingEnabled) {
+  if (params.continuousMode) {
+    // Continuous: show gradient bands from engagementStart down to finish
+    const nBands = Math.min(8, Math.max(2, Math.ceil(params.engagementStart / params.feedPerRev)));
+    for (let k = 0; k < nBands; k++) {
+      const offset = params.engagementStart * (1 - k / nBands);
+      if (offset > 1e-6) roughingSegArrays.push(offsetSegments(segs, params.toolRadius + offset));
+    }
+  } else if (params.roughingEnabled) {
     const minProfileR = Math.min(...segs.flatMap(s => [s.r1, s.r2]));
     const maxDepth    = params.stockRadius - minProfileR - params.finishAllowance;
     const N = Math.max(0, Math.ceil(maxDepth / params.passDepth));
     for (let k = 1; k <= N; k++) {
       const addlOffset = params.finishAllowance + (N - k) * params.passDepth;
-      const arr = offsetSegments(segs, params.toolRadius + addlOffset);
-      roughingSegArrays.push(arr);
+      roughingSegArrays.push(offsetSegments(segs, params.toolRadius + addlOffset));
     }
   }
 
@@ -964,13 +1281,26 @@ function generate() {
   document.getElementById('gcodeOutput').value = gcode;
 
   const gcodeLines = gcode.split('\n').length;
-  const passes     = Math.ceil(360 / params.stepover);
   const lineSegs   = segs.filter(s => s.type === 'line').length;
   const arcSegs    = segs.filter(s => s.type === 'arc').length;
-  const roughN     = roughingSegArrays.length;
+  let statsExtra = '';
+  if (params.continuousMode) {
+    const finOffSegs = offsetSegments(segs, params.toolRadius);
+    const finPts = tessellateSegments(finOffSegs, 0.5);
+    const minR = Math.min(...finPts.map(p => p[1]));
+    const covDeg = params.toolRadius > 0 && minR > params.toolRadius
+      ? (2 * Math.asin(Math.min(1, params.toolRadius / minR))) * (180 / Math.PI) : 5;
+    const step = Math.min(5, covDeg * 0.9);
+    const nPPR = Math.ceil(360 / step);
+    const nRR  = params.engagementStart > 0 ? Math.max(1, Math.ceil(params.engagementStart / params.feedPerRev)) : 0;
+    statsExtra = ` · continuous: ${nRR} rev × ${nPPR} passes/rev = ${(nRR + (params.contIncludeFinishing ? 1 : 0)) * nPPR} Z passes`;
+  } else {
+    const passes = Math.ceil(360 / params.stepover);
+    const roughN = roughingSegArrays.length;
+    statsExtra = ` · ${passes} passes` + (roughN ? ` · ${roughN} roughing` : '');
+  }
   document.getElementById('gcodeStats').textContent =
-    `${gcodeLines} lines · ${passes} passes · ${rawPoly.length} DXF pts → ${lineSegs}L + ${arcSegs}A segments`
-    + (roughN ? ` · ${roughN} roughing pass${roughN !== 1 ? 'es' : ''}` : '');
+    `${gcodeLines} lines · ${rawPoly.length} DXF pts → ${lineSegs}L + ${arcSegs}A segments` + statsExtra;
 
   const canvas = document.getElementById('previewCanvas');
   resizeCanvas(canvas);
